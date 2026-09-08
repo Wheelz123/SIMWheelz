@@ -66,7 +66,7 @@ except Exception:                       # no SDL runtime -> keyboard only
     SDL = None
     _HAS_SDL = False
 
-__version__ = "0.3"
+__version__ = "0.5"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -742,6 +742,7 @@ class Cockpit:
     def _build_right(self, parent):
         nb = ttk.Notebook(parent)
         nb.pack(fill="both", expand=True)
+        self._nb = nb
 
         # ---------------- COCKPIT tab (lamps/live/console per mockup)
         cockpit = ttk.Frame(nb)
@@ -882,8 +883,12 @@ class Cockpit:
         # Style settings and painted this footer green-on-light -> unreadable
         f = tk.Frame(self.root, bg="#101418")
         f.pack(fill="x", padx=8, pady=(0, 6))
-        kb = ("KEYBOARD   W/↑ gas   S/↓ brake   A/D steer   P R N D gear   "
-              "I ignition   SPACE parkbrake   H hazards   R reset")
+        # Primary drive row: larger + amber so the arrow keys are legible.
+        tk.Label(f, text="DRIVE   W/↑ gas   S/↓ brake   A/← steer L   D/→ steer R",
+                 bg="#101418", fg="#ffd60a", font=("Consolas", 11),
+                 anchor="w").pack(fill="x")
+        kb = ("KEYBOARD   P R N D gear   I IGNITION   SPACE parkbrake   "
+              "H hazards   C cruise   +/- set   A autopilot   U units   R reset")
         xb = ("controller   LS steer   RS gas/brake   LT/RT gas·brake   A D   B N   "
               "X parkbrake   Y reset   LB/RB P·D   BACK hazards   START ignition   "
               "C autopilot")
@@ -961,6 +966,20 @@ class Cockpit:
         self.root.bind("<KeyRelease-Left>", lambda e: self._key_steer(0.0))
         self.root.bind("<KeyPress-Right>", lambda e: self._key_steer(1.0))
         self.root.bind("<KeyRelease-Right>", lambda e: self._key_steer(0.0))
+
+        # Arrows must steer the car; a focused ttk.Notebook normally
+        # grabs <Left>/<Right> to cycle tabs (TNotebook class binding).
+        # Bind the arrows on the notebook widget itself (first bindtag)
+        # and return "break" so the class binding never flips the tab.
+        _nb = getattr(self, "_nb", None)
+        if _nb is not None:
+            for sym, press, rel in (
+                    ("Up", lambda: self._key_thr(1.0), lambda: self._key_thr(0.0)),
+                    ("Down", lambda: self._key_brk(1.0), lambda: self._key_brk(0.0)),
+                    ("Left", lambda: self._key_steer(-1.0), lambda: self._key_steer(0.0)),
+                    ("Right", lambda: self._key_steer(1.0), lambda: self._key_steer(0.0))):
+                _nb.bind(f"<KeyPress-{sym}>", lambda e, fn=press: (fn(), "break")[1])
+                _nb.bind(f"<KeyRelease-{sym}>", lambda e, fn=rel: (fn(), "break")[1])
         self.root.bind("<KeyPress-i>", lambda e: self._ign(True))
         self.root.bind("<KeyPress-I>", lambda e: self._ign(False))
         for g in "prndPRND":
@@ -978,9 +997,9 @@ class Cockpit:
         self.root.bind("<KeyPress-h>", lambda e: self._switch("hazard"))
         self.root.bind("<KeyPress-r>", lambda e: self.client.send({"t": "reset"}))
         self.root.bind("<KeyPress-F1>", lambda e: self._log(
-            "keys: W/S gas/brake, A/D steer, PRND gear, i ignition, "
-            "space parkbrake, h hazard, c cruise, +/- set, a autopilot, "
-            "u units, r reset"))
+            "keys: W/↑ S/↓ gas/brake, A/← D/→ steer (arrows or WASD), "
+            "PRND gear, i ignition, space parkbrake, h hazard, c cruise, "
+            "+/- set, a autopilot, u units, r reset"))
 
     def _ign(self, on):
         self.client.send({"t": "ignition", "on": on})
