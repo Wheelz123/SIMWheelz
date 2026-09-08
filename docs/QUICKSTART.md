@@ -1,12 +1,11 @@
 # carsim — cockpit simulator quickstart
 
-Drivable virtual car + OBD-II/UDS ECU cluster that talks exactly like the
-network CAN adapter. Two components:
+Drivable virtual car + OBD-II/UDS ECU cluster. Two components:
 
 | File | What it is |
 |---|---|
-| `tools/carsim.py` | Physics engine + fake ECUs + SLCAN-over-TCP server + JSON control channel + optional real SocketCAN (SocketCAN) wire mode + ICSim-style `--follower` drive input |
-| `tools/carsim_gui.py` | tkinter cockpit (three non-overlapping columns per the approved mockup): canvas road + tiled 3×3 gauge cluster, lamps, live-data table, CAN console + quick inject, keyboard **and** controller controller (USB) driving, cruise + 3-phase autopilot, fault injection, units |
+| `tools/carsim.py` | Physics engine + fake ECUs + SLCAN-over-TCP server + JSON control channel + optional SocketCAN (wired CAN bus) mode + ICSim-style `--follower` drive input |
+| `tools/carsim_gui.py` | tkinter cockpit (three non-overlapping columns per the approved mockup): canvas road + tiled 3×3 gauge cluster, lamps, live-data table, CAN console + quick inject, keyboard driving, cruise + 3-phase autopilot, fault injection, units |
 | `tests/cockpit_e2e.py` | End-to-end JSON regression test (start → drive → MIL → reset) |
 | `tests/ap_phase_e2e.py` | Autopilot 3-phase state-machine replay (cold start → D → cruise → stop) |
 
@@ -14,7 +13,7 @@ Or just use the launchers: `./run_sim.sh`, `./run_cockpit.sh`, `./run_tests.sh`.
 
 ---
 
-## 1. Start the sim (the "adapter server")
+## 1. Start the sim
 
 ```bash
 python3 tools/carsim.py --host 127.0.0.1 --slcan-port 20102 --ctrl-port 20103
@@ -34,7 +33,7 @@ Startup banner:
 ```
 carsim 0.1 - SLCAN server on 127.0.0.1:20102
   JSON control channel on 127.0.0.1:20103
-  client.py --host 127.0.0.1 --port 20102 ping|dtc|vin|live 0C 0D 05
+  SLCAN-over-TCP: nc 127.0.0.1 20102   (Lawicel V/N/F/t framing)
   follower drive: ON (reads 0x100/0x110/0x120/0x140/0x400 as remote input)
   Ctrl-C to stop
 ```
@@ -46,7 +45,7 @@ Full CLI (`--help` for the rest):
 | `--host ADDR` | bind address (default: all interfaces) |
 | `--slcan-port N` | SLCAN-over-TCP port (default **20102**) |
 | `--ctrl-port N` | JSON control port (default **20103**) |
-| `--iface can0` | **SocketCAN mode**: put ECUs + broadcasts on a real SocketCAN wire, disable the TCP SLCAN server |
+| `--iface can0` | **SocketCAN mode**: put ECUs + broadcasts on a real CAN wire, disable the TCP SLCAN server |
 | `--tcp-also` | keep the TCP SLCAN server in `--iface` mode too |
 | `--follower` | ICSim-style drive: treat bus frames 0x100/0x110/0x120/0x140/0x400 as remote drive input |
 | `--no-traffic` | silent bench: no broadcast frames, only ECU replies |
@@ -59,13 +58,12 @@ Full CLI (`--help` for the rest):
 ```bash
 python3 -m py_compile tools/carsim.py tools/carsim_gui.py
 python3 tools/carsim.py --selftest          # physics + OBD/UDS protocol
-python3 tools/carsim_gui.py --check         # GUI decode/inject/controller helpers
+python3 tools/carsim_gui.py --check         # GUI decode/inject helpers
 python3 tests/cockpit_e2e.py                # JSON end-to-end (needs sim running)
 python3 tests/ap_phase_e2e.py               # autopilot sequence (needs sim running)
 ```
 
-Point the e2e tests at another host/port with `CARSIM_HOST` / `CARSIM_PORT`
-(e.g. the setup link-local forwarder: `CARSIM_HOST=192.168.1.50`).
+Point the e2e tests at another host/port with `CARSIM_HOST` / `CARSIM_PORT`.
 
 Expected tails: `carsim selftest: ALL PASS`, `carsim_gui headless check:
 ALL PASS`, `E2E ALL PASS`, `ap phase-machine e2e: ALL PASS`.
@@ -74,7 +72,7 @@ ALL PASS`, `E2E ALL PASS`, `ap phase-machine e2e: ALL PASS`.
 
 ```bash
 python3 tools/carsim_gui.py                 # defaults to 127.0.0.1:20103
-python3 tools/carsim_gui.py --host 192.168.1.50   # cockpit over the setup link
+python3 tools/carsim_gui.py --host 192.168.1.50   # sim on another host
 ```
 
 ### Layout (approved mockup — no overlapping gauges)
@@ -82,7 +80,7 @@ python3 tools/carsim_gui.py --host 192.168.1.50   # cockpit over the setup link
 - **LEFT** — scrolling road + car sprite (the game view)
 - **MID** — tiled 3×3 instrument cluster (small, separate round gauges) + odo
 - **RIGHT** — warning lamps, live-data table, CAN console + quick inject
-- **FOOTER** — keyboard/controller hints and the broadcast-ID legend
+- **FOOTER** — keyboard hints and the broadcast-ID legend
 
 ### Driving (real-car order — the sim enforces it)
 
@@ -111,28 +109,11 @@ python3 tools/carsim_gui.py --host 192.168.1.50   # cockpit over the setup link
 | r | reset to P, engine off, DTCs cleared |
 | F1 | in-cockpit help line |
 
-### controller controller (USB or radio) — optional
-
-Controller support is soft-loaded: if the SDL runtime is missing, the
-GUI just falls back to keyboard (it prints `controller: SDL unavailable -
-keyboard only`). On start and on hot-plug it autodetects and reports e.g.
-`controller: game controller online (USB or radio)`.
-
-- **Works out of the box:** game controller models 1914 / 1708 and
-  BLE-capable pads — they expose a standard Linux controller device the instant
-  they connect, wired **or** over radio (Linux pairs it as a controller, no
-  driver needed).
-- **Older controller One pads** need the official controller remote Adapter for Windows
-  (they don't do plain radio).
-- Mapping: **LS** steer · **RS** gas/brake · **LT/RT** gas·brake · **A**=D ·
-  **B**=N · **X** park brake · **Y** reset · **LB/RB** P·D · **BACK** hazards ·
-  **START** ignition · **C** autopilot.
-
 ### CAN console + quick inject (can-utils / ICSim style)
 
-The SLCAN server (20102) is byte-compatible with a Lawicel adapter, so the
-**CAN console** sends real `cansend`-style lines straight into the sim's
-frame handler — the same code path a SocketCAN/vcan0 wire uses:
+The SLCAN server (20102) speaks standard Lawicel framing, so the **CAN
+console** sends real `cansend`-style lines straight into the sim's frame
+handler — the same code path a SocketCAN/vcan0 wire uses:
 
 ```
 7DF#02010D0000000000      OBD mode-01 PID 0D (speed) request -> ECU replies
@@ -170,22 +151,13 @@ Frame legend: **0x100** ENG · **0x110** CHAS · **0x120** STEER+lights ·
 
 ## 4. Talk to it from the command line
 
-SLCAN server (identical to the network adapter's TCP server):
+SLCAN-over-TCP (Lawicel framing):
 
 ```bash
 # nc 127.0.0.1 20102   then:
 V      -> V1013
 O      -> open the receive channel (frames start streaming)
 C      -> close the receive channel
-```
-
-Real diagnostics with the sibling tooling's `client.py` client:
-
-```bash
-client.py --host 127.0.0.1 --port 20102 ping
-client.py --host 127.0.0.1 --port 20102 dtc
-client.py --host 127.0.0.1 --port 20102 vin
-client.py --host 127.0.0.1 --port 20102 live 0C 0D 05   # rpm, speed, coolant
 ```
 
 JSON control channel (`20103`), one command per line:
@@ -211,19 +183,17 @@ and the sim pushes a full state snapshot per tick:
 
 > State key for road speed is **`speed`** (km/h).
 
-## 5. Wiring to a real CAN bus (SocketCAN mode)
+## 5. SocketCAN (wired CAN bus) mode
 
 ```bash
-sudo ip link set can0 up type can bitrate 500000      # or the adapter's own rate
+sudo ip link set can0 up type can bitrate 500000
 python3 tools/carsim.py --iface can0 --follower       # ECUs + traffic + drive on the wire
 python3 tools/carsim.py --iface can0 --tcp-also       # ...and keep TCP SLCAN too
 ```
 
 The ECUs answer functional requests on 0x7DF and stream 0x100–0x140 exactly
-like bench mode. With `--follower`, a real steering wheel / pedal setup (or
-`cansend can0 400#…`) drives the simulated car — that's the ICSim-on-real-
-SocketCAN mode. See `WIRING_network_PROOF.md` for setup network wiring and the
-network-proofing rules.
+like bench mode. With `--follower`, a real steering wheel / pedal set (or
+`cansend can0 400#…`) drives the simulated car.
 
 ## 6. Troubleshooting
 
@@ -231,9 +201,6 @@ network-proofing rules.
   `--host` at the wrong address. Start the sim first; then the GUI.
 - **Injected frames don't move the car** — the sim needs `--follower`
   (frames still appear in the inspector without it).
-- **"controller: none connected"** — plug the pad in / pair over BT *before*
-  starting the GUI, or hot-plug it (autodetect re-runs). No SDL → keyboard
-  only, by design.
 - **Old server versions dropped idle clients after 0.5 s** (a `socket.timeout`
   swallowed by a broad `except OSError`). Fixed — both reader loops now treat
   read timeouts as idle and keep the client. Passive listeners and idle GUI

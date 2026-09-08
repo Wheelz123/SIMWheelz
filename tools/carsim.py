@@ -13,25 +13,19 @@ Three personalities, one binary:
 
   1. TCP bench mode (default)
        carsim.py
-     Listens on 127.0.0.1:20102 as a Lawicel SLCAN-over-TCP *server*, byte
-     compatible with the remote CAN-adapter (reference): S/O/C/V/N/F commands,
-     "t" frames, V1013, N0000, F12.  The cockpit GUI (carsim_gui.py) drives it
-     over a second JSON control channel (port 20103).  Point client.py at it:
+     Listens on 127.0.0.1:20102 as a Lawicel SLCAN-over-TCP *server*:
+     S/O/C/V/N/F commands, "t" frames, V1013, N0000, F12.  The cockpit GUI
+     (carsim_gui.py) drives it over a second JSON control channel (port 20103).
+     Any standard SLCAN-over-TCP client can ping the ECUs, read DTCs/VIN, or
+     subscribe to live PIDs on this port.
 
-         python3 client.py --host 127.0.0.1 --port 20102 ping
-         python3 client.py --host 127.0.0.1 --port 20102 dtc
-         python3 client.py --host 127.0.0.1 --port 20102 vin
-         python3 client.py --host 127.0.0.1 --port 20102 live 0C 0D 05
-
-  2. SocketCAN / AF_CAN mode (the network-proof setup)
+  2. SocketCAN / wired-bus mode
        sudo ip link set can0 type can bitrate 500000 && sudo ip link set can0 up
        carsim.py --iface can0
-     Binds can0 with raw SocketCAN (same pattern as the reference ECU sim.py), puts the ECU
-     answers and the broadcast frames on the *wired* CAN bus.  The remote
-     CAN-adapter is plugged into that bus; the GUI (or client) reaches the car
-     only over the adapter's network:  GUI -> network -> adapter -> CAN wire -> carsim.
-     The TCP SLCAN server is OFF in this mode (--tcp-also to force it on) so
-     there is exactly one way to reach the car: through the radio path.
+     Binds can0 with raw SocketCAN, putting the ECU answers and the broadcast
+     frames on a real wired CAN bus so other bus participants (can-utils, a
+     physical SLCAN adapter, another host) can observe or drive the car.  The
+     TCP SLCAN server is OFF in this mode (--tcp-also to force it on).
 
   3. --selftest
        carsim.py --selftest
@@ -39,13 +33,7 @@ Three personalities, one binary:
      build pipeline; the sandbox has no display, so this is how the engine is
      verified before the GUI is ever opened.
 
-The proof that OBD really travels over network (vs. the old the old bench sim confusion):
-the old bench sim answered on the loopback interface, so the GUI kept working with the
-hardware unplugged.  carsim on can0 lives on the OTHER side of the adapter, so
-if the GUI still shows gauges with the adapter's network off, the data did not come
-from the car.  That contrast *is* the test.
-
-Lawicel SLCAN wire format (matches reference formatSLCAN/parseSLCAN):
+Lawicel SLCAN wire format:
     RX to client :  t<3hex id><1hex dlc><2hex per byte>\r   (uppercase data)
     TX from client: t<3hex id><1hex dlc><2hex per byte>\r   (T = extended id)
     V -> "V1013\r", N -> "N0000\r", F -> "F12\r", O opens, C closes.
@@ -97,7 +85,7 @@ __version__ = "0.3.3"
 #  Constants
 # --------------------------------------------------------------------------- #
 
-SLCAN_PORT = 20102            # Lawicel SLCAN-over-TCP server (adapter server)
+SLCAN_PORT = 20102            # Lawicel SLCAN-over-TCP server
 CTRL_PORT = 20103             # JSON control channel for the cockpit GUI
 
 ECU_ENGINE = 0x7E8            # engine  -> answers functional 0x7DF + phys 0x7E0
@@ -774,7 +762,7 @@ def handle_request(req_id, payload, p, faults, ecus_enabled):
 
 
 # --------------------------------------------------------------------------- #
-#  SLCAN-over-TCP server (adapter server, mirrors reference)
+#  SLCAN-over-TCP server (Lawicel framing)
 # --------------------------------------------------------------------------- #
 
 class SlcanClient:
@@ -977,7 +965,7 @@ class CtrlServer:
 
 
 # --------------------------------------------------------------------------- #
-#  AF_CAN (SocketCAN / SocketCAN) wire mode
+#  AF_CAN (SocketCAN) wired-bus mode
 # --------------------------------------------------------------------------- #
 
 class CanWire:
@@ -1362,7 +1350,7 @@ class CarSim:
                             for h, l, _s in abs_dtcs(self.faults)]
         state["mode"] = "can-wire" if self.wire else "tcp-bench"
         state["source"] = ("remote CAN inject" if self.remote_drive
-                          else "keyboard/controller")
+                          else "keyboard")
         self.ctrl.push(state)
 
     # -------------------------------------------------------------- main loop
@@ -1385,7 +1373,7 @@ class CarSim:
         else:
             print(f"carsim {__version__} - SLCAN server on {self.host or '0.0.0.0'}:{self.slcan_port}")
             print(f"  JSON control channel on {self.host or '0.0.0.0'}:{self.ctrl_port}")
-            print("  client.py --host %s --port %d ping|dtc|vin|live 0C 0D 05"
+            print("  SLCAN-over-TCP: nc %s %d   (Lawicel V/N/F/t framing)"
                   % (self.host or "127.0.0.1", self.slcan_port))
         print("  Ctrl-C to stop\n")
 
@@ -1596,15 +1584,15 @@ def selftest():
 def main():
     ap = argparse.ArgumentParser(
         description="Drivable virtual car: physics + OBD/UDS ECU cluster "
-                    "+ SLCAN-over-TCP server (adapter server) + SocketCAN mode.")
+                    "+ SLCAN-over-TCP server + SocketCAN wired-bus mode.")
     ap.add_argument("--host", default="", help="bind address (default all)")
     ap.add_argument("--slcan-port", type=int, default=SLCAN_PORT,
                     help="SLCAN-over-TCP port (default 20102)")
     ap.add_argument("--ctrl-port", type=int, default=CTRL_PORT,
                     help="JSON control port (default 20103)")
     ap.add_argument("--iface", default=None, metavar="CAN0",
-                    help="SocketCAN/SocketCAN interface; puts ECUs + broadcasts "
-                         "on the WIRE and disables the TCP SLCAN server")
+                    help="SocketCAN interface; puts ECUs + broadcasts on the "
+                         "WIRE and disables the TCP SLCAN server")
     ap.add_argument("--tcp-also", action="store_true",
                     help="keep the TCP SLCAN server in --iface mode")
     ap.add_argument("--no-traffic", action="store_true",

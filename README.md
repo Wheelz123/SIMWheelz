@@ -1,18 +1,19 @@
-# carsim — drivable CAN simulator ("adapter server" + cockpit)
+# carsim — drivable virtual CAN simulator + cockpit
 
-A virtual car that speaks **real OBD-II / UDS over SLCAN-over-TCP**, exactly
-like the network CAN adapter, with a drivable game cockpit on top. Use it to
-develop and test the remote-CAN monitor tooling (client, GUI, can-utils)
-without touching a vehicle — then put the same sim on a real SocketCAN wire and
-let `cansend` drive it.
+A virtual car that speaks **real OBD-II / UDS over SLCAN-over-TCP**, with a
+drivable game cockpit on top. No vehicle or CAN hardware is required: the whole
+bus — engine, TCM and ABS ECUs plus the classic broadcast frames — lives in
+`tools/carsim.py`, and `tools/carsim_gui.py` is the dashboard you drive it
+from. Use the sim to develop and test diagnostic clients, injection tooling
+and CAN monitors against a deterministic bench, then bind the same sim to a
+wired SocketCAN bus if you want other bus participants involved.
 
 | File | What it is |
 |---|---|
-| `tools/carsim.py` | Physics engine + ECU cluster (engine / TCM / ABS) + SLCAN-over-TCP server + JSON control channel + optional real SocketCAN (SocketCAN) wire mode + ICSim-style `--follower` drive input |
-| `tools/carsim_gui.py` | tkinter cockpit: canvas road, 3×3 gauge cluster, lamps + live data, CAN console + quick inject, CAN BUS monitor, keyboard **and** controller controller (USB) driving, cruise + 3-phase autopilot, body switches, faults, units |
+| `tools/carsim.py` | Physics engine + ECU cluster (engine / TCM / ABS) + SLCAN-over-TCP server + JSON control channel + optional SocketCAN (wired CAN bus) mode + ICSim-style `--follower` drive input |
+| `tools/carsim_gui.py` | tkinter cockpit: canvas road, 3×3 gauge cluster, lamps + live data, CAN console + quick inject, CAN BUS monitor, keyboard driving, cruise + 3-phase autopilot, body switches, faults, units |
 
-Requires **Python 3.10+** (tkinter for the GUI). `SDL` is optional — it only
-enables the controller/controller driver; the cockpit falls back to the keyboard.
+Requires **Python 3.10+** (tkinter for the GUI).
 
 ---
 
@@ -21,7 +22,7 @@ enables the controller/controller driver; the cockpit falls back to the keyboard
 Open two terminals in the repo root:
 
 ```bash
-# 1) run the sim (the "adapter server" — add --follower so injected frames drive the car)
+# 1) run the sim  (add --follower so injected frames drive the car)
 python3 tools/carsim.py --follower
 
 # 2) run the cockpit GUI
@@ -36,9 +37,8 @@ Or use the launchers:
 ./run_tests.sh        # headless self-test (compile + selftest + --check + both e2e)
 ```
 
-Default ports: **20102** SLCAN-over-TCP (the adapter server) and **20103** JSON
-control. Point the GUI or the e2e tests at another host with `--host` /
-`CARSIM_HOST`.
+Default ports: **20102** SLCAN-over-TCP and **20103** JSON control. Point the
+GUI or the e2e tests at another host with `--host` / `CARSIM_HOST`.
 
 ---
 
@@ -60,11 +60,6 @@ KEYBOARD P R N D gear   I IGNITION   SPACE parkbrake
 Start order matters (just like a real car): shift to **P or N**, press
 **I** to crank (~0.7 s), then shift to **D** and drive. R/P are blocked above
 8 km/h and you cannot crank in D.
-
-### controller / controller (optional)
-Plug in (or pair over radio) the controller **before** starting the GUI —
-autodetect runs at launch and re-runs on hot-plug. Triggers = gas/brake, left
-stick = steer, face buttons = gear. No SDL/SDL → keyboard only, by design.
 
 ### Cruise & autopilot
 - **C** — plain speed-hold; needs **D** and ≥ 40 km/h; `+`/`-` adjust the
@@ -145,22 +140,13 @@ The **CAN INJECT** bar parses `cansend`-style `ID#DATA` lines (e.g.
 
 ## 5. Talking to it from the command line
 
-SLCAN server (byte-identical to the network adapter):
+SLCAN-over-TCP (Lawicel framing):
 
 ```bash
 # nc 127.0.0.1 20102   then:
 V   -> V1013
 O   -> open the receive channel (frames start streaming)
 C   -> close the receive channel
-```
-
-Real diagnostics with the sibling tooling's `client.py` client:
-
-```bash
-client.py --host 127.0.0.1 --port 20102 ping
-client.py --host 127.0.0.1 --port 20102 dtc
-client.py --host 127.0.0.1 --port 20102 vin
-client.py --host 127.0.0.1 --port 20102 live 0C 0D 05
 ```
 
 JSON control channel (`20103`), one command per line:
@@ -180,7 +166,7 @@ DTCs, faults, `frames`, `events`, `switches`).
 
 ---
 
-## 6. Wiring to a real CAN bus (SocketCAN mode)
+## 6. SocketCAN (wired CAN bus) mode
 
 ```bash
 sudo ip link set can0 up type can bitrate 500000
@@ -189,9 +175,8 @@ python3 tools/carsim.py --iface can0 --tcp-also       # ...and keep TCP SLCAN to
 ```
 
 The ECUs answer functional requests on `0x7DF` and stream `0x100–0x140`
-exactly like bench mode. With `--follower`, a real steering wheel / pedal setup
-(or `cansend can0 400#…`) drives the simulated car. See
-`docs/WIRING_network_PROOF.md` for setup network wiring and network-proofing rules.
+exactly like bench mode. With `--follower`, a real steering wheel / pedal set
+(or `cansend can0 400#…`) drives the simulated car.
 
 ---
 
@@ -204,7 +189,7 @@ exactly like bench mode. With `--follower`, a real steering wheel / pedal setup
 | `--host ADDR` | bind address (default: all interfaces) |
 | `--slcan-port N` | SLCAN-over-TCP port (default 20102) |
 | `--ctrl-port N` | JSON control port (default 20103) |
-| `--iface can0` | SocketCAN mode: ECUs + broadcasts on a real SocketCAN wire, TCP SLCAN off |
+| `--iface can0` | SocketCAN mode: ECUs + broadcasts on a real CAN wire, TCP SLCAN off |
 | `--tcp-also` | keep the TCP SLCAN server in `--iface` mode |
 | `--follower` | ICSim-style drive: treat bus frames as remote drive input |
 | `--no-traffic` | silent bench: no broadcast frames, only ECU replies |
@@ -219,7 +204,7 @@ exactly like bench mode. With `--follower`, a real steering wheel / pedal setup
 ```bash
 python3 -m py_compile tools/carsim.py tools/carsim_gui.py
 python3 tools/carsim.py --selftest          # physics + OBD/UDS protocol
-python3 tools/carsim_gui.py --check         # GUI decode/inject/controller helpers
+python3 tools/carsim_gui.py --check         # GUI decode/inject helpers
 python3 tests/cockpit_e2e.py                # JSON end-to-end (needs sim running)
 python3 tests/ap_phase_e2e.py               # autopilot sequence (needs sim running)
 ```
@@ -236,8 +221,6 @@ runs them all against a freshly-started sim.
   `--host` at the wrong address. Start the sim first, then the GUI.
 - **Injected frames don't move the car** — the sim needs `--follower`
   (frames still appear in the monitor without it).
-- **"controller: none connected"** — plug in / pair before starting the GUI, or
-  hot-plug it (autodetect re-runs). No SDL → keyboard only.
 - **Gears won't shift** — R/P are blocked above 8 km/h and you cannot crank in
   D. Brake, shift to P/N, then start.
 - **Cruise won't engage** — it needs D **and** ≥ 40 km/h.
@@ -251,26 +234,8 @@ runs them all against a freshly-started sim.
 
 | File | Purpose |
 |---|---|
-| `docs/QUICKSTART.md` | full CLI / keybinding / controller / injection reference |
-| `docs/WIRING_network_PROOF.md` | bench / network-setup / real-CAN wiring diagrams |
-| `docs/TEST_EVIDENCE.md` | verification evidence and regression notes |
+| `docs/QUICKSTART.md` | full CLI / keybinding / injection reference |
 | `tests/cockpit_e2e.py` | JSON drive-cycle e2e (`CARSIM_HOST`/`CARSIM_PORT` overridable) |
 | `tests/ap_phase_e2e.py` | autopilot 3-phase state-machine replay |
-
----
-
-## Version highlights (v0.9.x cockpit line)
-
-- **v0.9.3** — restored the DRIVE + KEYBOARD instruction rows and the
-  Bus-broadcast legend in the footer (after they were accidentally removed);
-  fixed the grey/blank window caused by `ttk.PanedWindow`.
-- **v0.9.4** — added **body switches** (DOOR FL/FR/RL/RR, TRUNK, HOOD, BELT)
-  that synthesize a 0x130 BODY TX frame on the bus.
-- **v0.9.5** — CAN BUS monitor **highlight**: changed RX frames in **cyan**,
-  cockpit-sent TX frames in **amber**.
-- **v0.9.6** — monitor **readability**: `0x130` decoded by door name
-  (`doors FL,FR` / `all closed`) and long frames **wrap** so nothing clips.
-
-`carsim.py` is v0.3.3 (independent version line, unchanged by cockpit work).
 
 MIT licensed.

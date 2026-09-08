@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-carsim_gui.py — the cockpit for carsim.py (the "driver" side of the setup).
+carsim_gui.py — the cockpit for carsim.py (the "driver" side of the sim).
 
 The simulator (tools/carsim.py) is the ECU cluster + physics engine.  It
 publishes everything over a JSON control channel (default 127.0.0.1:20103):
@@ -11,8 +11,8 @@ publishes everything over a JSON control channel (default 127.0.0.1:20103):
     RX {"t":"switch","name":"hazard","on":true}   {"t":"fault","name":"mil","on":true}
     RX {"t":"cruise","on":true}  {"t":"cruise","delta":5}   {"t":"reset"}
 
-The simulator's SLCAN-over-TCP server (default 127.0.0.1:20102) is byte-compatible
-with a Lawicel adapter, so the CAN CONSOLE below sends real "cansend-style"
+The simulator's SLCAN-over-TCP server (default 127.0.0.1:20102) speaks
+standard Lawicel framing, so the CAN CONSOLE below sends real "cansend-style"
 frames straight into CarSim.handle_rx_frame() — the same path a SocketCAN/vcan0
 wire uses.  With the sim started --follower, injected 0x100/0x110/0x120/0x140/
 0x400 frames fold into the physics and the game reacts.
@@ -29,20 +29,11 @@ Layout (three non-overlapping columns, per the approved mockup):
   * RECORD captures the live stream (scope RX/TX/ALL, optional id filter,
     RX-changed-only) to a text dump; SAVE writes it; LOAD reads a dump back
     and REPLAY re-injects it at the original timing into whichever CAN
-    output the cockpit is wired to (second sim, network setup, SocketCAN server).
-Input: keyboard AND controller controller (over USB or radio).  Controller support
-is optional — if the SDL SDL runtime is missing it simply falls back to
-keyboard.  The USB/radio note: a game controller (models 1914/1708,
-BLE) exposes a standard Linux controller device the instant it connects, no driver
-needed; older controller One pads need the remote adapter.
-
+    output the cockpit is wired to (a second sim).
 Run against a local bench sim:
     python3 tools/carsim.py --follower &   # ECU side, ctrl :20103 / slcan :20102
     python3 tools/carsim_gui.py
 
-Run against the network setup (adapter next to the SocketCAN):
-    python3 tools/carsim.py --iface can0 --follower &      # on the car machine
-    python3 tools/carsim_gui.py --host 192.168.4.1         # on the laptop
 
 Headless logic check:  python3 tools/carsim_gui.py --check
 """
@@ -68,13 +59,6 @@ except Exception:                       # non-GUI env / --check still works
     filedialog = None
     _HAS_TK = False
 
-try:                                    # optional controller controller input
-    import SDL
-    _HAS_SDL = True
-    SDL.init()
-except Exception:                       # no SDL runtime -> keyboard only
-    SDL = None
-    _HAS_SDL = False
 
 __version__ = "0.9.6"
 
@@ -282,7 +266,7 @@ def inject_advisory(can_id):
     Returns None when no disclaimer is needed."""
     if can_id == DRIVE_IN:
         return ("DRIVE_IN cmd - the sim applies 0x400 only when started with "
-                "--follower (keyboard/controller drive regardless)")
+                "--follower (keyboard drive regardless)")
     if can_id in STATUS_IDS:
         return ("status frame (%s %s) - the sim publishes these itself, so "
                 "injecting one never commands the drivetrain; to drive, send "
@@ -362,8 +346,8 @@ def rec_to_cansend(items):
 
 
 class CanInjector:
-    """Thin SLCAN-over-TCP client: opens the adapter server and sends 't' frames.
-    This is exactly what cansend does against a SocketCAN/Lawicel adapter."""
+    """Thin SLCAN-over-TCP client: opens the sim's SLCAN port and sends 't' frames.
+    This is exactly what cansend does against a Lawicel SLCAN adapter."""
 
     def __init__(self, host, port, on_log=None):
         self.host = host
@@ -398,7 +382,7 @@ class CanInjector:
                 with self._lock:
                     self.sock = s
                 self.status = "online"
-                s.sendall(b"O\r")                    # open the adapter channel
+                s.sendall(b"O\r")                    # open the SLCAN channel
                 if self.on_log:
                     self.on_log(f"CAN injector online {self.host}:{self.port}")
             except OSError:
@@ -569,53 +553,6 @@ class CockpitClient:
         return self.status == "online"
 
 
-# --------------------------------------------------------------------------- #
-#  controller controller input (USB / radio) - optional SDL
-# --------------------------------------------------------------------------- #
-def map_pad(axes, buttons, hat, prev):
-    """Pure mapping: controller axes/buttons -> cockpit drive commands.
-
-    game controller (USB or BT) on Linux via SDL exposes:
-      axes:  0=LX, 1=LY, 2=LT, 3=RT, 4=RX, 5=RY   (triggers -1..1, idle -1)
-      buttons: 0=A 1=B 2=X 3=Y 4=LB 5=RB 6=Back 7=Start 8=Guide 9=LS 10=RS
-    Returns {throttle, brake, steer, events:[...]} where events are edge actions
-    fired only on a rising button edge (prev is the previous buttons tuple).
-    """
-    def ax(i, default=0.0):
-        return axes[i] if i < len(axes) else default
-
-    def btn(i):
-        return buttons[i] if i < len(buttons) else 0
-
-    steer = ax(0)                                    # left stick X
-    # throttle/brake: prefer right stick Y (down=+1 -> brake, up=-1 -> gas)
-    ry = ax(5)
-    throttle = max(0.0, -ry) if len(axes) >= 6 else 0.0
-    brake = max(0.0, ry) if len(axes) >= 6 else 0.0
-    # triggers (if present) override: positive pull -> 0..1
-    lt = max(0.0, ax(2) + 1.0) if len(axes) > 2 else 0.0    # idle -1 -> 0
-    rt = max(0.0, ax(3) + 1.0) if len(axes) > 3 else 0.0
-    if rt > 0.02 or lt > 0.02:
-        brake = max(brake, lt)
-        throttle = max(throttle, rt)
-
-    events = []
-    def pressed(i, action):
-        if btn(i) and not prev[i]:
-            events.append(action)
-
-    pressed(0, ("gear", "D"))        # A -> D
-    pressed(1, ("gear", "N"))        # B -> N
-    pressed(2, "parkbrake")          # X -> parkbrake toggle
-    pressed(3, "reset")              # Y -> reset
-    pressed(4, ("gear", "P"))        # LB -> P
-    pressed(5, ("gear", "D"))        # RB -> D
-    pressed(6, "hazard")             # Back -> hazard toggle
-    pressed(7, "ignition")           # Start -> ignition toggle
-
-    return {"throttle": throttle, "brake": brake, "steer": steer,
-            "events": events}
-
 
 # --------------------------------------------------------------------------- #
 #  Road + gauge drawing helpers (only used when Tk is present)
@@ -705,95 +642,21 @@ class Cockpit:
         self._rp_items = []
         self._rp_i = 0
         self._rp_t0 = 0.0
-        self._last_gp_tx = (None, None, None)   # last controller TX (deadband)
         self._ap_t0 = 0.0
         self._ap_phase = 0
         self._last_live = None
-        self._pad_prev = (0,) * 16
-        self._pad_available = False
-        self._pad_rescan_t = 0.0
 
         self.client = CockpitClient(host, ctrl_port, on_state=self._on_state,
                                     on_log=self._log)
         self.injector = CanInjector(host, slcan_port, on_log=self._log)
-        self._init_controller()
 
-        self.root.title("CAN FIRECOCKPIT - carsim setup")
+        self.root.title("CAN FIRECOCKPIT - carsim")
         self.root.configure(bg="#0b0d10")
         self._build_ui()
         self._bind_keys()
         self._last_render = 0.0
         self._ap_last = 0.0
         self._tick()
-
-    # ------------------------------------------------------------ controller
-    def _init_controller(self):
-        if not _HAS_SDL:
-            self._log("controller: SDL unavailable - keyboard only")
-            return
-        SDL.event.pump()
-        if SDL.controller.get_count() == 0:
-            self._log("controller: no controller found (controller via USB or BT). "
-                      "Keyboard active until one connects.")
-            return
-        self._pad = SDL.controller.controller(0)
-        self._pad.init()
-        self._pad_available = True
-        self._log(f"controller: {self._pad.get_name()} online (USB or radio)")
-
-    def _poll_controller(self):
-        if not _HAS_SDL:
-            return
-        if not self._pad_available:
-            # Hot-plug rescan ~1/s: a pad that connects AFTER launch (controller
-            # over USB or radio) is discovered without restarting the
-            # cockpit.  Disconnects re-arm this path automatically.
-            if time.monotonic() - self._pad_rescan_t >= 1.0:
-                self._pad_rescan_t = time.monotonic()
-                SDL.event.pump()
-                if SDL.controller.get_count() > 0:
-                    self._init_controller()
-            return
-        SDL.event.pump()
-        try:
-            axes = [self._pad.get_axis(i) for i in range(self._pad.get_numaxes())]
-            nbtn = self._pad.get_numbuttons()
-            buttons = tuple(self._pad.get_button(i) for i in range(nbtn))
-            hat = (0, 0)
-            if self._pad.get_numhats() > 0:
-                hat = tuple(self._pad.get_hat(0))
-        except SDL.error:
-            self._pad_available = False
-            self._log("controller: disconnected - keyboard only")
-            return
-        cmd = map_pad(axes, buttons, hat, self._pad_prev)
-        self._pad_prev = buttons
-        self.thr_var.set(cmd["throttle"] * 100.0)
-        self.brk_var.set(cmd["brake"] * 100.0)
-        self.steer_var.set(cmd["steer"] * 100.0)
-        self.client.send({"t": "input", "throttle": cmd["throttle"],
-                          "brake": cmd["brake"], "steer": cmd["steer"]})
-        gp = (cmd["throttle"], cmd["brake"], cmd["steer"])
-        last = getattr(self, "_last_gp_tx", (None, None, None))
-        if any(a is None or abs(a - b) > 0.03 for a, b in zip(gp, last)):
-            self._last_gp_tx = gp
-            self._log_tx(*build_drive(
-                throttle=gp[0], brake=gp[1], steer=gp[2],
-                gear=self._state.get("gear", "D")), src="pad drive")
-        for ev in cmd["events"]:
-            if isinstance(ev, tuple):
-                self.client.send({"t": "gear", "gear": ev[1]})
-                self._log_tx(*build_drive(gear=ev[1]),
-                             src=f"pad gear {ev[1]}")
-            elif ev == "parkbrake":
-                self._switch("parkbrake")
-            elif ev == "hazard":
-                self._switch("hazard")
-            elif ev == "ignition":
-                self._ign(not self._state.get("engine_on", False))
-            elif ev == "reset":
-                self.client.send({"t": "reset"})
-            self._log(f"controller: {ev}")
 
     # ------------------------------------------------------------ state hook
     def _on_state(self, msg):
@@ -960,7 +823,7 @@ class Cockpit:
         tk.Label(top, text="odo:", bg="#0b0d10", fg="#8b98a5").pack(side="left")
         self.odo_lbl = tk.Label(top, text="0.0 km", bg="#0b0d10", fg="#e8e8e8")
         self.odo_lbl.pack(side="left", padx=(0, 12))
-        self.source_lbl = tk.Label(top, text="drive: keyboard/controller",
+        self.source_lbl = tk.Label(top, text="drive: keyboard",
                                   bg="#0b0d10", fg="#ffd60a")
         self.source_lbl.pack(side="left", padx=(0, 12))
         self.units_var = tk.StringVar(value="km/h")
@@ -1761,7 +1624,6 @@ class Cockpit:
     # --------------------------------------------------------------- render
     def _tick(self):
         now = time.monotonic()
-        self._poll_controller()
         self._render()
         self._drain_events()
         self._update_hint()
@@ -1784,7 +1646,7 @@ class Cockpit:
         self.ts_lbl.configure(text=f"{st.get('ts', 0.0):.1f} s")
         self.odo_lbl.configure(text=f"{st.get('odo', 0.0):.1f} km")
         self.source_lbl.configure(
-            text="drive: " + st.get("source", "keyboard/controller"))
+            text="drive: " + st.get("source", "keyboard"))
         self.cruise_lbl.configure(text=("on" if st.get("cruise_on") else "off"))
         self.dtc_lbl.configure(text=self._dtc_text(st))
         self._render_road(st)
@@ -2285,30 +2147,6 @@ def _headless_check():
                    "0x130" in (inject_advisory(0x130) or "")))
     checks.append(("advisory diag none", inject_advisory(0x7E8) is None))
 
-    # ---- controller mapping (pure, no controller needed)
-    axes = [0.0, 0.0, -1.0, -1.0, 0.0, 0.0]                # idle: triggers -1
-    btns = (0,) * 16
-    cmd = map_pad(axes, btns, (0, 0), btns)
-    checks.append(("map_pad idle", abs(cmd["throttle"]) < 1e-6 and
-                   abs(cmd["brake"]) < 1e-6))
-    # full right stick up -> throttle; down -> brake
-    axes = [1.0, 0.0, -1.0, -1.0, 0.0, -1.0]               # LX right, RY up
-    cmd = map_pad(axes, btns, (0, 0), btns)
-    checks.append(("map_pad steer right", cmd["steer"] > 0.9))
-    checks.append(("map_pad RY throttle", cmd["throttle"] > 0.9))
-    axes = [0.0, 0.0, 1.0, 1.0, 0.0, 0.0]                  # triggers pulled (on 2/3)
-    cmd = map_pad(axes, btns, (0, 0), btns)
-    checks.append(("map_pad trigger throttle", cmd["throttle"] > 0.9))
-    checks.append(("map_pad trigger brake", cmd["brake"] > 0.9))
-    # rising button edge -> gear event
-    prev = (0,) * 16
-    cur = list(prev)
-    cur[0] = 1                                              # A pressed
-    cmd = map_pad([0.0] * 6, tuple(cur), (0, 0), prev)
-    checks.append(("map_pad A->D", ("gear", "D") in cmd["events"]))
-    # held button: no repeat (edge only)
-    cmd2 = map_pad([0.0] * 6, tuple(cur), (0, 0), tuple(cur))
-    checks.append(("map_pad edge no-repeat", cmd2["events"] == []))
 
     # ---- gauge geometry
     checks.append(("gauge_angle min", abs(gauge_angle(0, 240) - 135.0) < 1e-6))
@@ -2359,7 +2197,7 @@ def main():
     ap.add_argument("--slcan-port", type=int, default=SL_PORT,
                     help=f"SLCAN injector port (default {SL_PORT})")
     ap.add_argument("--check", action="store_true",
-                    help="run headless decode/inject/controller checks and exit")
+                    help="run headless decode/inject checks and exit")
     args = ap.parse_args()
 
     if args.check:
