@@ -75,7 +75,7 @@ except Exception:                       # no SDL runtime -> keyboard only
     SDL = None
     _HAS_SDL = False
 
-__version__ = "0.6.1"
+__version__ = "0.7.0"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -966,13 +966,27 @@ class Cockpit:
         self._build_footer()
 
     def _build_right(self, parent):
-        nb = ttk.Notebook(parent)
-        nb.pack(fill="both", expand=True)
-        self._nb = nb
+        # All former tabs now show SIMULTANEOUSLY in ONE scrollable panel
+        # (no clicking).  Sections stack vertically under headers; a vertical
+        # scrollbar appears only on short windows.
+        self._nb = None
+        rcanvas = tk.Canvas(parent, bg="#0e0e0e", highlightthickness=0)
+        rcanvas.pack(side="left", fill="both", expand=True)
+        rsb = ttk.Scrollbar(parent, orient="vertical", command=rcanvas.yview)
+        rsb.pack(side="right", fill="y")
+        rcanvas.configure(yscrollcommand=rsb.set)
+        inner = ttk.Frame(rcanvas)
+        self._r_win = inner
+        self._r_canvas = rcanvas
+        self._r_win_id = rcanvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: rcanvas.configure(
+            scrollregion=rcanvas.bbox("all")))
+        rcanvas.bind("<Configure>", lambda e: rcanvas.itemconfigure(
+            self._r_win_id, width=e.width))
 
-        # ---------------- COCKPIT tab (lamps/live/console per mockup)
-        cockpit = ttk.Frame(nb)
-        nb.add(cockpit, text="Cockpit")
+        # ---------------- COCKPIT (lamps/live/console per mockup)
+        cockpit = ttk.LabelFrame(inner, text="COCKPIT")
+        cockpit.pack(fill="both", expand=True, padx=2, pady=(0, 4))
         self.lamps_cv = tk.Canvas(cockpit, height=70, bg="#0e0e0e",
                                   highlightthickness=0)
         self.lamps_cv.pack(fill="x", padx=4, pady=(4, 0))
@@ -1005,11 +1019,9 @@ class Cockpit:
             ttk.Button(q, text=t, command=c).grid(
                 row=i // 4, column=i % 4, padx=2, pady=2, sticky="ew")
 
-        # ---------------- CAN BUS tab (live frame monitor, decoded names).
-        # Own tab: the Cockpit tab's height budget (~490 px) can't hold the
-        # monitor inline, so it got clipped off-screen in the old layout.
-        canbus = ttk.Frame(nb)
-        nb.add(canbus, text="CAN BUS")
+        # ---------------- CAN BUS (live frame monitor, decoded names).
+        canbus = ttk.LabelFrame(inner, text="CAN BUS  (click=copy  double-click=load)  ")
+        canbus.pack(fill="both", expand=True, padx=2, pady=(0, 4))
         tk.Label(canbus,
                  text="CLICK = copy   DOUBLE-CLICK = load into CAN INJECT",
                  bg="#0a0a0a", fg="#ffd60a", font=("Consolas", 9),
@@ -1062,8 +1074,8 @@ class Cockpit:
         self.bus_txt.bind("<Double-Button-1>", self._bus_load)
 
         # ---------------- SERVICE tab (ignition/gear/switch/fault/cruise/AP)
-        service = ttk.Frame(nb)
-        nb.add(service, text="Service")
+        service = ttk.LabelFrame(inner, text="SERVICE / DIAGNOSTICS")
+        service.pack(fill="both", expand=True, padx=2, pady=(0, 0))
 
         ttk.Label(service, text="Ignition").grid(row=0, column=0, sticky="w")
         self.ign_btn = ttk.Button(service, text="START",
@@ -1146,6 +1158,23 @@ class Cockpit:
                                font=("Consolas", 8), relief="flat")
         self.log_box.grid(row=10, column=0, columnspan=4, sticky="ew",
                           pady=(6, 0))
+
+        # mousewheel scroll for the merged single panel
+        for w in (rcanvas, inner):
+            w.bind("<MouseWheel>", self._on_rwheel)
+            w.bind("<Button-4>", lambda e: rcanvas.yview_scroll(-3, "units"))
+            w.bind("<Button-5>", lambda e: rcanvas.yview_scroll(3, "units"))
+
+    def _on_rwheel(self, ev):
+        c = getattr(self, "_r_canvas", None)
+        if c is None:
+            return
+        try:
+            d = int(-1 * (ev.delta / 120))
+        except Exception:
+            d = 0
+        c.yview_scroll(d, "units")
+        return "break"
 
     def _build_footer(self):
         # Built from plain tk widgets (no ttk): native themes ignore ttk
