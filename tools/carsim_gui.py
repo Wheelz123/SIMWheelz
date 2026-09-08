@@ -75,7 +75,7 @@ except Exception:                       # no SDL runtime -> keyboard only
     SDL = None
     _HAS_SDL = False
 
-__version__ = "0.6"
+__version__ = "0.6.1"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -643,6 +643,11 @@ class Cockpit:
         self.autopilot = False
         self.ap_target = 100.0
         self._state = {}
+        self._ev_q = []            # sim events queued by the RX thread
+        self._last_ev = ""         # most recently logged event text
+        self._ev_seen = []         # small ring of logged events (spam guard)
+        self._last_hint = None     # hint text currently shown
+        self.hint_lbl = None       # footer hint label (built in footer)
         self._scroll = 0.0
         self._car_lat = 0.0          # lateral car position (road stays fixed)
         self._lat_rate = 12.0        # px per render tick at full steer (lane-hold)
@@ -748,6 +753,7 @@ class Cockpit:
     # ------------------------------------------------------------ state hook
     def _on_state(self, msg):
         self._state = msg
+        self._ev_q.extend(msg.get("events", []))
         self._sync_frames(msg.get("frames", []))
 
     def _sync_frames(self, frames):
@@ -761,6 +767,58 @@ class Cockpit:
             self.frame_history.append(rec)
             self._rec_frame(rec)
         self.frame_history = self.frame_history[-120:]
+
+    def _drain_events(self):
+        """Move sim events queued by the RX thread into the Service log.
+
+        The sim re-pushes its rolling event window on every state update,
+        so a plain append would spam repeats; keep a small ring of recently
+        logged events and only write the ones not shown yet."""
+        while self._ev_q:
+            ev = self._ev_q.pop(0)
+            if ev in self._ev_seen:
+                continue
+            self._last_ev = ev
+            self._ev_seen.append(ev)
+            del self._ev_seen[:-10]
+            self._log("EV  " + ev)
+
+    def _hint_text(self, st):
+        """Engine/gear-aware footer hint: what the next key will do."""
+        gear = st.get("gear", "P")
+        if not st.get("engine_on"):
+            if gear in ("P", "N"):
+                return ("ENGINE OFF gear %s | press i / START to crank, "
+                        "then D and hold %s" % (gear, "↑"))
+            return ("ENGINE OFF gear %s | shift to P or N, then i / START"
+                    % gear)
+        if gear == "P":
+            return "park: %s only revs the engine - press D to drive" % "↑"
+        if gear == "N":
+            return "neutral: no drive - press D"
+        if gear == "R":
+            return "reverse: %s accelerates backward" % "↑"
+        if st.get("speed", 0.0) < 0.5:
+            if st.get("brake", 0.0) > 0.05:
+                return ("brake held - release %s then hold %s to launch"
+                        % ("↓", "↑"))
+            return "gear D: hold %s to launch" % "↑"
+        return "gear D engine ON"
+
+    def _hint_colour(self, text):
+        low = text.lower()
+        if any(k in low for k in ("engine off", "park", "neutral",
+                                  "brake held")):
+            return "#ffd60a"      # blocking - driver action needed
+        return "#9fc7e8"
+
+    def _update_hint(self):
+        if self.hint_lbl is None:
+            return
+        text = self._hint_text(self._state)
+        if text != self._last_hint:
+            self._last_hint = text
+            self.hint_lbl.configure(text=text, fg=self._hint_colour(text))
 
     def _log(self, text):
         if getattr(self, "log_box", None) is not None:
@@ -1070,6 +1128,10 @@ class Cockpit:
         # Style settings and painted this footer green-on-light -> unreadable
         f = tk.Frame(self.root, bg="#101418")
         f.pack(fill="x", padx=8, pady=(0, 6))
+        # Contextual drive hint: engine/gear-aware guidance, always visible.
+        self.hint_lbl = tk.Label(f, text="", bg="#101418", fg="#9fc7e8",
+                                 font=("Consolas", 10, "bold"), anchor="w")
+        self.hint_lbl.pack(fill="x", pady=(0, 2))
         # Primary drive row: larger + amber so the arrow keys are legible.
         tk.Label(f, text="DRIVE   W/↑ gas   S/↓ brake   A/← steer L   D/→ steer R",
                  bg="#101418", fg="#ffd60a", font=("Consolas", 11),
@@ -1355,6 +1417,8 @@ class Cockpit:
         now = time.monotonic()
         self._poll_controller()
         self._render()
+        self._drain_events()
+        self._update_hint()
         if self.autopilot and (now - self._ap_last) > 0.1:
             self._ap_last = now
             self._autopilot()
@@ -1365,6 +1429,11 @@ class Cockpit:
         self.status_lbl.configure(
             text=f"status: {self.client.status}  ctrl:{self.host}:{self.port}"
                  f"  bus:{self.injector.status} {self.host}:{self.sl_port}")
+        # Truthful START/RUNNING: _ign() sets the label optimistically, but
+        # the sim may reject the crank (engine off while in D, etc.), so the
+        # label is driven from state.engine_on every frame.
+        self.ign_btn.configure(
+            text="RUNNING" if st.get("engine_on") else "START")
         self.mode_lbl.configure(text=st.get("mode", "-"))
         self.ts_lbl.configure(text=f"{st.get('ts', 0.0):.1f} s")
         self.odo_lbl.configure(text=f"{st.get('odo', 0.0):.1f} km")
