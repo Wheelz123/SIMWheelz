@@ -23,6 +23,12 @@ Layout (three non-overlapping columns, per the approved mockup):
   * RIGHT - warning lamps, live-data table, CAN console + quick inject, controls
   * FOOTER- keyboard + controller-controller hints and the broadcast-ID legend
 
+  * CAN BUS tab - click a line to copy that frame to the clipboard, or
+    double-click to load it straight into the CAN INJECT box.
+  * RECORD captures the live stream (scope RX/TX/ALL, optional id filter,
+    RX-changed-only) to a text dump; SAVE writes it; LOAD reads a dump back
+    and REPLAY re-injects it at the original timing into whichever CAN
+    output the cockpit is wired to (second sim, network setup, SocketCAN server).
 Input: keyboard AND controller controller (over USB or radio).  Controller support
 is optional — if the SDL SDL runtime is missing it simply falls back to
 keyboard.  The USB/radio note: a game controller (models 1914/1708,
@@ -43,6 +49,7 @@ Headless logic check:  python3 tools/carsim_gui.py --check
 import argparse
 import json
 import math
+import os
 import re
 import socket
 import sys
@@ -52,10 +59,12 @@ import time
 try:
     import tkinter as tk
     from tkinter import ttk
+    from tkinter import filedialog
     _HAS_TK = True
 except Exception:                       # non-GUI env / --check still works
     tk = None
     ttk = None
+    filedialog = None
     _HAS_TK = False
 
 try:                                    # optional controller controller input
@@ -66,7 +75,7 @@ except Exception:                       # no SDL runtime -> keyboard only
     SDL = None
     _HAS_SDL = False
 
-__version__ = "0.5"
+__version__ = "0.6"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -254,6 +263,76 @@ def parse_cansend(text):
     return can_id, data
 
 
+# --------------------------------------------------------------------------- #
+#  Frame-capture / recorder helpers (pure -> unit-testable)
+# --------------------------------------------------------------------------- #
+def fmt_can_id(fid):
+    s = "%X" % int(fid)
+    return s if len(s) >= 3 else s.zfill(3)
+
+
+def slcan_tx_line(can_id, data):
+    """Lawicel wire frame for a raw CAN frame (used by the injector + tests).
+    't' + 3 hex id (11-bit) / 'T' + 8 hex id (29-bit), then dlc + data."""
+    if can_id is None or can_id < 0 or can_id > 0x1FFFFFFF or len(data) > 8:
+        return None
+    if can_id > 0x7FF:
+        return "T%08X%d%s" % (can_id, len(data), data.hex().upper())
+    return "t%03X%d%s" % (can_id, len(data), data.hex().upper())
+
+
+def capture_cansend(fid, hexs):
+    """'cansend vcan0 ID#DATA' text for a captured frame (COPY / load to inject)."""
+    try:
+        fid = int(fid)
+        hexs = (hexs or "").strip().upper()
+        bytes.fromhex(hexs)
+    except (TypeError, ValueError):
+        return None
+    if len(hexs) // 2 > 8 or fid < 0 or fid > 0x1FFFFFFF or hexs == "":
+        return None
+    return "cansend vcan0 %s#%s" % (fmt_can_id(fid), hexs)
+
+
+CAP_LINE_RE = re.compile(
+    r"^\s*([0-9]+(?:\.[0-9]+)?)\s+(RX|TX)\s+"
+    r"([0-9A-Fa-f]{3,8})\s+([0-9A-Fa-f]{2,16})(?:\s.*)?$")
+
+
+def parse_capture_text(text):
+    """Parse a recorder dump back into replay items.
+    Lines: '<sec> RX|TX <id-hex> <data-hex> [# optional src]', '#' = comment."""
+    out = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = CAP_LINE_RE.match(line)
+        if not m:
+            continue
+        sec, d, hid, hx = m.groups()
+        try:
+            fid = int(hid, 16)
+            data = bytes.fromhex(hx)
+        except ValueError:
+            continue
+        if len(data) > 8:
+            continue
+        out.append({"sec": float(sec), "dir": d, "id": fid,
+                    "data": hx.upper(), "dlc": len(data)})
+    return out
+
+
+def rec_to_cansend(items):
+    """Concat a saved/parsed dump into 'cansend vcan0 ID#DATA' lines."""
+    out = []
+    for it in items:
+        c = capture_cansend(it.get("id"), it.get("data"))
+        if c:
+            out.append(c)
+    return "\n".join(out)
+
+
 class CanInjector:
     """Thin SLCAN-over-TCP client: opens the adapter server and sends 't' frames.
     This is exactly what cansend does against a SocketCAN/Lawicel adapter."""
@@ -315,16 +394,16 @@ class CanInjector:
             self.status = "offline"
 
     def send_frame(self, can_id, data):
-        if len(data) > 8:
+        line = slcan_tx_line(can_id, data)
+        if line is None:
             return False
-        line = f"t{can_id:03X}{len(data):X}{data.hex().upper()}\r"
         with self._lock:
             s = self.sock
         if s is None:
             self.status = "offline"
             return False
         try:
-            s.sendall(line.encode("ascii"))
+            s.sendall((line + "\r").encode("ascii"))
             return True
         except OSError:
             return False
@@ -335,7 +414,7 @@ class CanInjector:
             return False, "bad frame (want 400#FF00038000000000)"
         can_id, data = parsed
         if self.send_frame(can_id, data):
-            return True, f"t{can_id:03X}{len(data)}{data.hex().upper()}"
+            return True, slcan_tx_line(can_id, data) or ""
         return False, "injector offline"
 
 
@@ -566,9 +645,27 @@ class Cockpit:
         self._state = {}
         self._scroll = 0.0
         self._car_lat = 0.0          # lateral car position (road stays fixed)
+        self._lat_rate = 12.0        # px per render tick at full steer (lane-hold)
         self._prev_frames = {}
         self.frame_history = []
         self._bus_seq = 0
+        self._bus_view = []          # records rendered in CAN BUS monitor
+        self._cap_lbl = None         # capture-feedback label
+        self._rec_cnt_lbl = None     # live frame-count label
+        self._rec_btn = None         # RECORD toggle button
+        self._rp_btn = None          # REPLAY/STOP toggle button
+        self._rec_on = False         # traffic recorder running
+        self._rec_scope = "all"      # all | rx | tx
+        self._rec_filter = ""        # optional hex id filter ("," / space list)
+        self._rx_delta = False       # RX changed-only mode
+        self._rec_last = {}          # id -> last RX data (delta mode)
+        self._rec_frames = []        # recorded / loaded items (ms, dir, id, data, src)
+        self._rec_t0 = None
+        self._rp_job = None          # pending root.after id (replay chain)
+        self._rp_stop = False
+        self._rp_items = []
+        self._rp_i = 0
+        self._rp_t0 = 0.0
         self._last_gp_tx = (None, None, None)   # last controller TX (deadband)
         self._ap_t0 = 0.0
         self._ap_phase = 0
@@ -657,11 +754,12 @@ class Cockpit:
         # log EVERY received frame so the CAN BUS monitor shows the live
         # stream (each id updates at its own broadcast period)
         for fr in frames:
-            self.frame_history.append(
-                {"ts": time.strftime("%H:%M:%S"),
-                 "id": fr.get("id"), "dlc": fr.get("dlc", 8),
-                 "data": fr.get("data", "")})
-            self._bus_seq = getattr(self, "_bus_seq", 0) + 1
+            self._bus_seq += 1
+            rec = {"ts": time.strftime("%H:%M:%S"),
+                   "id": fr.get("id"), "dlc": fr.get("dlc", 8),
+                   "data": fr.get("data", ""), "n": self._bus_seq}
+            self.frame_history.append(rec)
+            self._rec_frame(rec)
         self.frame_history = self.frame_history[-120:]
 
     def _log(self, text):
@@ -672,11 +770,57 @@ class Cockpit:
     def _log_tx(self, fid, data, src):
         """Log a locally-produced CAN frame into the bus monitor (TX side)
         so every cockpit action is visibly tied to the frame it produces."""
-        self.frame_history.append(
-            {"ts": time.strftime("%H:%M:%S"), "id": fid, "dlc": len(data),
-             "data": data.hex().upper(), "tx": True, "src": src})
+        self._bus_seq += 1
+        rec = {"ts": time.strftime("%H:%M:%S"), "id": fid, "dlc": len(data),
+               "data": data.hex().upper(), "tx": True, "src": src,
+               "n": self._bus_seq}
+        self.frame_history.append(rec)
         self.frame_history = self.frame_history[-120:]
-        self._bus_seq = getattr(self, "_bus_seq", 0) + 1
+        self._rec_frame(rec)
+
+    # ------------------------------------------------------- traffic recorder
+    def _rec_pass(self, rec):
+        """Scope / RX-delta / id-filter gate for the traffic recorder."""
+        tx = bool(rec.get("tx"))
+        if self._rec_scope == "rx" and tx:
+            return False
+        if self._rec_scope == "tx" and not tx:
+            return False
+        if self._rx_delta and not tx:
+            key = rec.get("id")
+            hexs = rec.get("data", "")
+            if self._rec_last.get(key) == hexs:
+                return False
+            self._rec_last[key] = hexs
+        filt = (self._rec_filter or "").strip()
+        if filt:
+            want = []
+            for tok in filt.replace(",", " ").split():
+                try:
+                    want.append(int(tok, 16))
+                except ValueError:
+                    continue
+            if want and rec.get("id") not in want:
+                return False
+        return True
+
+    def _rec_frame(self, rec):
+        """Append a monitor record to the recorder when it is running."""
+        if not self._rec_on or not self._rec_pass(rec):
+            return
+        if str(rec.get("src", "")).startswith("replay"):   # never re-record replay
+            return
+        if self._rec_t0 is None:
+            self._rec_t0 = time.monotonic()
+        ms = int(round((time.monotonic() - self._rec_t0) * 1000.0))
+        hexs = rec.get("data") or ""
+        self._rec_frames.append({"ms": ms,
+                                 "dir": "TX" if rec.get("tx") else "RX",
+                                 "id": rec.get("id"),
+                                 "dlc": rec.get("dlc", len(hexs) // 2),
+                                 "data": hexs.upper(),
+                                 "src": rec.get("src", "")})
+        self._update_rec_cnt()
 
     # ============================================================== UI build
     def _build_ui(self):
@@ -784,13 +928,56 @@ class Cockpit:
         # monitor inline, so it got clipped off-screen in the old layout.
         canbus = ttk.Frame(nb)
         nb.add(canbus, text="CAN BUS")
-        self.bus_txt = tk.Text(canbus, height=16, bg="#0a0a0a", fg="#cfd8e0",
+        tk.Label(canbus,
+                 text="CLICK = copy   DOUBLE-CLICK = load into CAN INJECT",
+                 bg="#0a0a0a", fg="#ffd60a", font=("Consolas", 9),
+                 anchor="w").pack(fill="x", padx=4, pady=(4, 0))
+        recf = ttk.LabelFrame(canbus, text="TRAFFIC RECORD / REPLAY")
+        recf.pack(fill="x", padx=4, pady=(4, 2))
+        r1 = ttk.Frame(recf)
+        r1.pack(fill="x", padx=4, pady=2)
+        self._rec_btn = ttk.Button(r1, text="\u25cf RECORD",
+                                   command=self._rec_toggle)
+        self._rec_btn.pack(side="left")
+        self._rec_cnt_lbl = ttk.Label(r1, text="0 frames")
+        self._rec_cnt_lbl.pack(side="left", padx=8)
+        self._scope_var = tk.StringVar(value="all")
+        for lab, val in (("ALL", "all"), ("RX", "rx"), ("TX", "tx")):
+            rb = ttk.Radiobutton(r1, text=lab, value=val,
+                                variable=self._scope_var,
+                                command=lambda v=val: self._set_scope(v))
+            rb.pack(side="left", padx=(6, 0))
+        self._rxdelta_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r1, text="RX changed only",
+                        variable=self._rxdelta_var).pack(side="left", padx=8)
+        r2 = ttk.Frame(recf)
+        r2.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Label(r2, text="id filter").pack(side="left")
+        self._idfilt_var = tk.StringVar(value="")
+        e_filt = ttk.Entry(r2, textvariable=self._idfilt_var, width=14)
+        e_filt.pack(side="left", padx=4)
+        e_filt.bind("<KeyRelease>",
+                    lambda e: setattr(self, "_rec_filter", self._idfilt_var.get()))
+        ttk.Button(r2, text="SAVE", command=self._rec_save).pack(side="left",
+                                                                  padx=(8, 0))
+        ttk.Button(r2, text="LOAD", command=self._rec_load).pack(side="left",
+                                                                  padx=(4, 0))
+        self._rp_btn = ttk.Button(r2, text="REPLAY", command=self._replay_toggle)
+        self._rp_btn.pack(side="left", padx=(4, 0))
+        self._cap_lbl = tk.Label(canbus, text="", bg="#0a0a0a", fg="#9fc7e8",
+                                 font=("Consolas", 9), anchor="w")
+        self._cap_lbl.pack(fill="x", padx=4, pady=(0, 2))
+        busrow = ttk.Frame(canbus)
+        busrow.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.bus_txt = tk.Text(busrow, height=12, bg="#0a0a0a", fg="#cfd8e0",
                                font=("Consolas", 8), relief="flat", padx=4,
                                pady=2, wrap="none")
-        self.bus_sb = ttk.Scrollbar(canbus, command=self.bus_txt.yview)
+        self.bus_sb = ttk.Scrollbar(busrow, command=self.bus_txt.yview)
         self.bus_txt.configure(yscrollcommand=self.bus_sb.set)
         self.bus_txt.pack(side="left", fill="both", expand=True)
         self.bus_sb.pack(side="right", fill="y")
+        self.bus_txt.bind("<Button-1>", self._bus_capture)
+        self.bus_txt.bind("<Double-Button-1>", self._bus_load)
 
         # ---------------- SERVICE tab (ignition/gear/switch/fault/cruise/AP)
         service = ttk.Frame(nb)
@@ -999,7 +1186,9 @@ class Cockpit:
         self.root.bind("<KeyPress-F1>", lambda e: self._log(
             "keys: W/↑ S/↓ gas/brake, A/← D/→ steer (arrows or WASD), "
             "PRND gear, i ignition, space parkbrake, h hazard, c cruise, "
-            "+/- set, a autopilot, u units, r reset"))
+            "+/- set, a autopilot, u units, r reset   |   CAN BUS tab: "
+            "click a frame = copy, double-click = load into inject   |   "
+            "RECORD/SAVE/LOAD/REPLAY capture the stream and replay it"))
 
     def _ign(self, on):
         self.client.send({"t": "ignition", "on": on})
@@ -1199,7 +1388,11 @@ class Cockpit:
         self._bus_rendered = seq
         self.bus_txt.configure(state="normal")
         self.bus_txt.delete("1.0", "end")
-        for rec in self.frame_history[-36:]:
+        view = self.frame_history[-36:]
+        self._bus_view = view
+        self.bus_txt.tag_configure("capture", background="#26313d",
+                                   foreground="#ffffff")
+        for rec in view:
             try:
                 dec = decode_frame(rec)
                 fields = "  ".join(f"{k} {v}"
@@ -1214,6 +1407,212 @@ class Cockpit:
             self.bus_txt.insert("end", line + "\n")
         self.bus_txt.configure(state="disabled")
         self.bus_txt.see("end")
+
+    # ------------------------------------------------- CAN BUS capture + recorder
+    def _bus_line_rec(self, index):
+        try:
+            ln = int(str(index).split(".")[0])
+        except Exception:
+            return None
+        view = getattr(self, "_bus_view", [])
+        if 1 <= ln <= len(view):
+            return view[ln - 1]
+        return None
+
+    def _clipline(self, line):
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(line)
+        except Exception:
+            pass
+
+    def _bus_highlight(self, ev):
+        try:
+            idx = self.bus_txt.index("@%d,%d" % (ev.x, ev.y))
+            ln = idx.split(".")[0]
+            self.bus_txt.tag_remove("capture", "1.0", "end")
+            self.bus_txt.tag_add("capture", ln + ".0", ln + ".end")
+        except Exception:
+            pass
+
+    def _bus_capture(self, ev):
+        """Single click: copy the frame under the cursor to the clipboard."""
+        rec = self._bus_line_rec(self.bus_txt.index("@%d,%d" % (ev.x, ev.y)))
+        if not rec:
+            return
+        line = capture_cansend(rec.get("id"), rec.get("data"))
+        if not line:
+            return
+        self._clipline(line)
+        self._bus_highlight(ev)
+        self._log("copied " + line)
+        if self._cap_lbl is not None:
+            self._cap_lbl.configure(text="COPIED  " + line)
+
+    def _bus_load(self, ev):
+        """Double click: copy AND load the frame into the CAN INJECT box."""
+        rec = self._bus_line_rec(self.bus_txt.index("@%d,%d" % (ev.x, ev.y)))
+        if not rec:
+            return
+        line = capture_cansend(rec.get("id"), rec.get("data"))
+        if not line:
+            return
+        self._clipline(line)
+        self.inject_var.set(line)
+        self._bus_highlight(ev)
+        self._log("inject <- " + line)
+        if self._cap_lbl is not None:
+            self._cap_lbl.configure(text="INJECT <-   " + line)
+
+    def _set_scope(self, v):
+        self._rec_scope = v
+
+    def _update_rec_cnt(self):
+        if self._rec_cnt_lbl is not None:
+            self._rec_cnt_lbl.configure(text="%d frames" % len(self._rec_frames))
+
+    def _rec_toggle(self):
+        self._rec_on = not self._rec_on
+        if self._rec_on:
+            self._rec_frames = []
+            self._rec_t0 = None
+            self._rec_last = {}
+            self._rx_delta = bool(self._rxdelta_var.get())
+            self._rec_filter = self._idfilt_var.get()
+            if self._rec_btn is not None:
+                self._rec_btn.configure(text="STOP")
+            self._log("record: ON   scope=%s  filter='%s'  changed-only=%s"
+                      % (self._rec_scope, self._rec_filter, self._rx_delta))
+        else:
+            if self._rec_btn is not None:
+                self._rec_btn.configure(text="\u25cf RECORD")
+            self._log("record: OFF   %d frames" % len(self._rec_frames))
+        self._update_rec_cnt()
+
+    def _rec_save(self):
+        if not self._rec_frames:
+            self._log("save: nothing recorded")
+            return
+        if filedialog is None:
+            self._log("save: no file dialog (tk unavailable)")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save CAN frame dump", defaultextension=".txt",
+            initialfile="can_dump_" + time.strftime("%H%M%S") + ".txt",
+            filetypes=[("CAN frame dump", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        lines = []
+        for it in self._rec_frames:
+            sec = it.get("ms", 0) / 1000.0
+            src = it.get("src", "")
+            tail = ("  # %s" % src) if src else ""
+            lines.append("%.3f  %s  %s  %s%s" % (
+                sec, it.get("dir", "RX"), fmt_can_id(it.get("id")),
+                (it.get("data") or ""), tail))
+        header = "# carsim traffic dump  scope=%s  frames=%d  %s\n" % (
+            self._rec_scope, len(self._rec_frames), time.strftime("%H:%M:%S"))
+        cansend = "# cansend lines (paste into CAN INJECT / cansend):\n" \
+            + rec_to_cansend(self._rec_frames) + "\n"
+        try:
+            with open(path, "w") as f:
+                f.write(header)
+                f.write("\n".join(lines) + "\n\n")
+                f.write(cansend)
+        except OSError as e:
+            self._log("save FAIL: %s" % e)
+            return
+        self._log("save: %d frames -> %s"
+                  % (len(self._rec_frames), os.path.basename(path)))
+
+    def _rec_load(self):
+        if filedialog is None:
+            self._log("load: no file dialog (tk unavailable)")
+            return
+        path = filedialog.askopenfilename(
+            title="Load CAN frame dump",
+            filetypes=[("CAN frame dump", "*.txt"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            txt = open(path).read()
+        except OSError as e:
+            self._log("load FAIL: %s" % e)
+            return
+        items = parse_capture_text(txt)
+        if not items:
+            self._log("load: no frames parsed from %s" % os.path.basename(path))
+            return
+        for it in items:
+            it["ms"] = int(round(it.get("sec", 0.0) * 1000.0))
+        self._rec_frames = items
+        self._log("load: %d frames from %s"
+                  % (len(items), os.path.basename(path)))
+        self._update_rec_cnt()
+
+    def _q_send_raw(self, fid, data, src):
+        if self.injector.send_frame(fid, data):
+            self._log("TX %s#%s  <%s>" % (fmt_can_id(fid),
+                                          data.hex().upper(), src))
+            self._log_tx(fid, data, src=src)
+        else:
+            self._log("replay FAIL: injector offline")
+            self._replay_stop()
+
+    def _replay_toggle(self):
+        if self._rp_job is not None and not self._rp_stop:
+            self._replay_stop()
+            return
+        if not self._rec_frames:
+            self._log("replay: nothing queued (record or LOAD first)")
+            return
+        self._rp_items = list(self._rec_frames)
+        self._rp_i = 0
+        self._rp_t0 = time.monotonic()
+        self._rp_stop = False
+        if self._rp_btn is not None:
+            self._rp_btn.configure(text="STOP")
+        self._log("replay: %d frames" % len(self._rp_items))
+        self._replay_tick()
+
+    def _replay_tick(self):
+        if self._rp_stop:
+            return
+        items = self._rp_items
+        if self._rp_i >= len(items):
+            self._replay_finish()
+            return
+        item = items[self._rp_i]
+        base = items[0]["ms"] if items else 0
+        target = item["ms"] - base
+        now_ms = int((time.monotonic() - self._rp_t0) * 1000.0)
+        if now_ms < target:
+            self._rp_job = self.root.after(min(target - now_ms, 10000),
+                                          self._replay_tick)
+            return
+        self._rp_i += 1
+        data = bytes.fromhex(item.get("data", "") or "00")
+        self._q_send_raw(item.get("id"), data, "replay")
+        self._rp_job = self.root.after(5, self._replay_tick)
+
+    def _replay_stop(self):
+        self._rp_stop = True
+        if self._rp_job is not None:
+            try:
+                self.root.after_cancel(self._rp_job)
+            except Exception:
+                pass
+            self._rp_job = None
+        if self._rp_btn is not None:
+            self._rp_btn.configure(text="REPLAY")
+        self._log("replay stopped (%d frames)" % self._rp_i)
+
+    def _replay_finish(self):
+        self._rp_job = None
+        self._rp_stop = False
+        if self._rp_btn is not None:
+            self._rp_btn.configure(text="REPLAY")
+        self._log("replay done (%d frames)" % self._rp_i)
 
     def _dtc_text(self, st):
         parts = []
@@ -1236,8 +1635,11 @@ class Cockpit:
         speed_kmh = abs(st.get("speed", 0.0))
         self._scroll += speed_kmh / 3.6 * 0.1
         steer = st.get("steer", 0.0) / 100.0
-        # road stays fixed; the CAR moves laterally within it
-        self._car_lat = max(-90.0, min(90.0, steer * 90.0))
+        # road stays fixed; the CAR moves laterally within it.  Steering is
+        # INTEGRATED, so the car changes lane while the key is held and HOLDS
+        # its lane when the key is released (no auto-recenter to the middle).
+        self._car_lat += steer * getattr(self, "_lat_rate", 12.0)
+        self._car_lat = max(-90.0, min(90.0, self._car_lat))
         road_center = w / 2.0
         road_w = 300.0
         cv.create_rectangle(road_center - road_w / 2, 0, road_center + road_w / 2,
@@ -1502,6 +1904,28 @@ def _headless_check():
     checks.append(("gauge_angle max", abs(gauge_angle(240, 240) - 405.0) < 1e-6))
     pts = arc_points(100, 100, 80, 135, 405, 48)
     checks.append(("arc_points", len(pts) == 2 * (48 + 1)))
+
+    # ---- v0.6 capture + recorder helpers
+    s = slcan_tx_line(0x400, bytes.fromhex("FF00038000000000"))
+    checks.append(("slcan 11-bit", s == "t4008FF00038000000000"))
+    s = slcan_tx_line(0x18DA10F1, bytes.fromhex("0601040100000000"))
+    checks.append(("slcan 29-bit", s == "T18DA10F180601040100000000"))
+    cc = capture_cansend(0x100, "28024463C0000900")
+    checks.append(("capture cansend", cc == "cansend vcan0 100#28024463C0000900"))
+    cc = capture_cansend(0x400, "FF00038000000000")
+    checks.append(("capture 0x400", cc == "cansend vcan0 400#FF00038000000000"))
+    checks.append(("capture rejects bad hex", capture_cansend(0x100, "ZZ") is None))
+    items = parse_capture_text(
+        "# comment\n0.01  RX  100  28024463C0000900\n"
+        "0.02  TX  400  FF00038000000000\njunk\n")
+    checks.append(("parse dump len", len(items) == 2))
+    checks.append(("parse dump id0", items[0]["id"] == 0x100 and
+                   items[0]["dir"] == "RX"))
+    checks.append(("parse dump id1", items[1]["id"] == 0x400 and
+                   items[1]["dir"] == "TX"))
+    c = rec_to_cansend(items)
+    checks.append(("rec_to_cansend", "400#FF00038000000000" in c and
+                   "100#28024463C0000900" in c))
 
     fail = 0
     for name, ok in checks:
