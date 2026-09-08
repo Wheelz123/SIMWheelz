@@ -5,3 +5,7 @@ venv/
 logs/
 *.log
 .DS_Store
+
+# preserved local capture - never commit
+tools/can_dump_*.txt
+can_dump_*.txt
