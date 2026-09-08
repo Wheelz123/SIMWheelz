@@ -568,6 +568,8 @@ class Cockpit:
         self._car_lat = 0.0          # lateral car position (road stays fixed)
         self._prev_frames = {}
         self.frame_history = []
+        self._bus_seq = 0
+        self._last_gp_tx = (None, None, None)   # last controller TX (deadband)
         self._ap_t0 = 0.0
         self._ap_phase = 0
         self._last_live = None
@@ -624,9 +626,18 @@ class Cockpit:
         self.steer_var.set(cmd["steer"] * 100.0)
         self.client.send({"t": "input", "throttle": cmd["throttle"],
                           "brake": cmd["brake"], "steer": cmd["steer"]})
+        gp = (cmd["throttle"], cmd["brake"], cmd["steer"])
+        last = getattr(self, "_last_gp_tx", (None, None, None))
+        if any(a is None or abs(a - b) > 0.03 for a, b in zip(gp, last)):
+            self._last_gp_tx = gp
+            self._log_tx(*build_drive(
+                throttle=gp[0], brake=gp[1], steer=gp[2],
+                gear=self._state.get("gear", "D")), src="pad drive")
         for ev in cmd["events"]:
             if isinstance(ev, tuple):
                 self.client.send({"t": "gear", "gear": ev[1]})
+                self._log_tx(*build_drive(gear=ev[1]),
+                             src=f"pad gear {ev[1]}")
             elif ev == "parkbrake":
                 self._switch("parkbrake")
             elif ev == "hazard":
@@ -650,12 +661,22 @@ class Cockpit:
                 {"ts": time.strftime("%H:%M:%S"),
                  "id": fr.get("id"), "dlc": fr.get("dlc", 8),
                  "data": fr.get("data", "")})
+            self._bus_seq = getattr(self, "_bus_seq", 0) + 1
         self.frame_history = self.frame_history[-120:]
 
     def _log(self, text):
         if getattr(self, "log_box", None) is not None:
             self.log_box.insert("end", text + "\n")
             self.log_box.see("end")
+
+    def _log_tx(self, fid, data, src):
+        """Log a locally-produced CAN frame into the bus monitor (TX side)
+        so every cockpit action is visibly tied to the frame it produces."""
+        self.frame_history.append(
+            {"ts": time.strftime("%H:%M:%S"), "id": fid, "dlc": len(data),
+             "data": data.hex().upper(), "tx": True, "src": src})
+        self.frame_history = self.frame_history[-120:]
+        self._bus_seq = getattr(self, "_bus_seq", 0) + 1
 
     # ============================================================== UI build
     def _build_ui(self):
@@ -882,10 +903,15 @@ class Cockpit:
     def _send_inject(self):
         ok, msg = self.injector.send_cansend(self.inject_var.get())
         self._log(("SENT " if ok else "FAIL ") + msg)
+        if ok:
+            parsed = parse_cansend(self.inject_var.get())
+            if parsed:
+                self._log_tx(parsed[0], parsed[1], src="console")
 
     def _q_inject(self, fid, data):
         if self.injector.send_frame(fid, data):
             self._log(f"inj {fid:03X}#{data.hex().upper()}")
+            self._log_tx(fid, data, src="quick inject")
         else:
             self._log("inj FAIL: injector offline")
 
@@ -939,8 +965,7 @@ class Cockpit:
         self.root.bind("<KeyPress-I>", lambda e: self._ign(False))
         for g in "prndPRND":
             self.root.bind(f"<KeyPress-{g}>",
-                           lambda e, g=g: self.client.send(
-                               {"t": "gear", "gear": g.upper()}))
+                           lambda e, g=g: self._key_gear(g.upper()))
         self.root.bind("<KeyPress-c>", lambda e: self._cruise_toggle())
         self.root.bind("<KeyPress-C>", lambda e: self._cruise_toggle())
         self.root.bind("<KeyPress-plus>", lambda e: self._cruise_delta(5))
@@ -960,6 +985,9 @@ class Cockpit:
     def _ign(self, on):
         self.client.send({"t": "ignition", "on": on})
         self.ign_btn.configure(text="START" if not on else "RUNNING")
+        self._log_tx(*build_realistic_0x100(
+            rpm=800 if on else 0, throttle=0.0),
+            src=f"ign {'on' if on else 'off'}")
 
     def _cruise_toggle(self):
         self.client.send({"t": "cruise", "on": not self._state.get(
@@ -994,9 +1022,27 @@ class Cockpit:
         if cur is not None:
             cur.set(not cur.get())
             self.client.send({"t": "switch", "name": name, "on": cur.get()})
+            self._switch_tx(name, cur.get())
 
     def _switch3(self, name, var):
         self.client.send({"t": "switch", "name": name, "on": var.get()})
+        self._switch_tx(name, var.get())
+
+    def _switch_tx(self, name, on):
+        """Synthetic TX for the broadcast frame that carries this switch."""
+        if name == "parkbrake":
+            self._log_tx(*build_realistic_0x110(
+                speed_kmh=float(self._state.get("speed", 0.0)),
+                brake_pct=100 if on else 0,
+                flags=0x08 if on else 0),
+                src=f"sw {name} {'ON' if on else 'OFF'}")
+            return
+        lamps = {"headlights": 0x04, "wipers": 0x10, "hazard": 0x20}.get(
+            name, 0x01)
+        self._log_tx(*build_realistic_0x120(
+            steer=float(self._state.get("steer", 0.0)) / 100.0,
+            lamps=lamps if on else 0),
+            src=f"sw {name} {'ON' if on else 'OFF'}")
 
     def _fault3(self, name, var):
         self.client.send({"t": "fault", "name": name, "on": var.get()})
@@ -1015,16 +1061,35 @@ class Cockpit:
         self.client.send({"t": "input", "throttle": v,
                           "brake": self.brk_var.get() / 100.0,
                           "steer": self.steer_var.get() / 100.0})
+        self._log_tx(*build_drive(
+            throttle=v, brake=self.brk_var.get() / 100.0,
+            steer=self.steer_var.get() / 100.0,
+            gear=self._state.get("gear", "D")),
+            src=f"key thr {v:.0f}")
 
     def _key_brk(self, v):
         self.brk_var.set(v * 100.0)
         self.client.send({"t": "input", "throttle": self.thr_var.get() / 100.0,
                           "brake": v, "steer": self.steer_var.get() / 100.0})
+        self._log_tx(*build_drive(
+            throttle=self.thr_var.get() / 100.0, brake=v,
+            steer=self.steer_var.get() / 100.0,
+            gear=self._state.get("gear", "D")),
+            src=f"key brk {v:.0f}")
 
     def _key_steer(self, v):
         self.steer_var.set(v * 100.0)
         self.client.send({"t": "input", "throttle": self.thr_var.get() / 100.0,
                           "brake": self.brk_var.get() / 100.0, "steer": v})
+        self._log_tx(*build_drive(
+            throttle=self.thr_var.get() / 100.0,
+            brake=self.brk_var.get() / 100.0, steer=v,
+            gear=self._state.get("gear", "D")),
+            src=f"key steer {v:.0f}")
+
+    def _key_gear(self, g):
+        self.client.send({"t": "gear", "gear": g})
+        self._log_tx(*build_drive(gear=g), src=f"key gear {g}")
 
     # ------------------------------------------------------------ autopilot
     def _autopilot(self):
@@ -1109,10 +1174,10 @@ class Cockpit:
         """Live CAN BUS monitor: every RX frame, decoded per function."""
         if not getattr(self, "bus_txt", None):
             return
-        n = len(self.frame_history)
-        if n == getattr(self, "_bus_rendered", -1):
+        seq = getattr(self, "_bus_seq", 0)
+        if seq == getattr(self, "_bus_rendered", -1):
             return
-        self._bus_rendered = n
+        self._bus_rendered = seq
         self.bus_txt.configure(state="normal")
         self.bus_txt.delete("1.0", "end")
         for rec in self.frame_history[-36:]:
@@ -1120,8 +1185,10 @@ class Cockpit:
                 dec = decode_frame(rec)
                 fields = "  ".join(f"{k} {v}"
                                    for k, v in dec["fields"].items())
-                line = (f"{rec.get('ts', '')}  0x{dec['id']:03X} "
-                        f"{dec['name']:<9} {dec['hex']:<20} | {fields}")
+                d = "TX" if rec.get("tx") else "RX"
+                src = " <- " + rec["src"] if rec.get("src") else ""
+                line = (f"{rec.get('ts', '')}  {d} 0x{dec['id']:03X} "
+                        f"{dec['name']:<9} {dec['hex']:<20} | {fields}{src}")
             except Exception:
                 line = (f"{rec.get('ts', '')}  {rec.get('id', '?'):#x} "
                         f"{rec.get('data', '')}")
