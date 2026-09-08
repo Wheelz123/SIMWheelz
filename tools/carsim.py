@@ -91,7 +91,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.3"
+__version__ = "0.3.1"
 
 # --------------------------------------------------------------------------- #
 #  Constants
@@ -1273,6 +1273,7 @@ class CarSim:
 
         # periodic chimes / warnings
         now = self.phys.t
+        mono = time.monotonic()      # broadcast-schedule clock: survives reset()
         lamps = compute_lamps(self.phys, self.faults, self.switches)
         if lamps["seatbelt"] and now - self._last_chime > 5.0:
             ev.append("seatbelt chime")
@@ -1296,8 +1297,8 @@ class CarSim:
         if not self.no_traffic:
             out = []
             for fid, (period, next_t) in self._frames.items():
-                if now >= next_t:
-                    self._frames[fid] = (period, now + period)
+                if mono >= next_t:
+                    self._frames[fid] = (period, mono + period)
                     data = self._frame_builders[fid][1]()
                     if self.wire is not None:
                         self.wire.send(fid, data)
