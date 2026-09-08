@@ -264,6 +264,30 @@ def parse_cansend(text):
 
 
 # --------------------------------------------------------------------------- #
+#  Frame-semantics advisory (pure -> unit-testable)
+# --------------------------------------------------------------------------- #
+# 0x400 DRIVE_IN is the only frame the sim consumes as a drivetrain command,
+# and only when carsim.py was started with --follower.  The 0x1xx IDs are the
+# status broadcasts the sim itself publishes every cycle (engine, chassis,
+# steer/lights, body, gear/fuel): putting them on the wire never moves the car.
+STATUS_IDS = frozenset((0x100, 0x110, 0x120, 0x130, 0x140))
+
+
+def inject_advisory(can_id):
+    """Truthful one-line note on what injecting this ID can do on the bench.
+    Returns None when no disclaimer is needed."""
+    if can_id == DRIVE_IN:
+        return ("DRIVE_IN cmd - the sim applies 0x400 only when started with "
+                "--follower (keyboard/controller drive regardless)")
+    if can_id in STATUS_IDS:
+        return ("status frame (%s %s) - the sim publishes these itself, so "
+                "injecting one never commands the drivetrain; to drive, send "
+                "400#FF00038000000000 with the sim in --follower mode"
+                % (hex(can_id), FRAME_NAMES.get(can_id, "")))
+    return None
+
+
+# --------------------------------------------------------------------------- #
 #  Frame-capture / recorder helpers (pure -> unit-testable)
 # --------------------------------------------------------------------------- #
 def fmt_can_id(fid):
@@ -1161,6 +1185,9 @@ class Cockpit:
             parsed = parse_cansend(self.inject_var.get())
             if parsed:
                 self._log_tx(parsed[0], parsed[1], src="console")
+                adv = inject_advisory(parsed[0])
+                if adv:
+                    self._log("note " + adv)
 
     def _q_inject(self, fid, data):
         if self.injector.send_frame(fid, data):
@@ -1942,6 +1969,15 @@ def _headless_check():
     checks.append(("parse 0x100 cansend", p2 is not None and p2[0] == 0x100))
     checks.append(("parse rejects junk", parse_cansend("hello world") is None))
     checks.append(("parse rejects >8", parse_cansend("400#112233445566778899") is None))
+
+    # ---- frame-semantics advisory (v0.6.2)
+    checks.append(("advisory 0x400", "DRIVE_IN" in (inject_advisory(0x400) or "")))
+    checks.append(("advisory status",
+                   "0x110" in (inject_advisory(0x110) or "") and
+                   "status" in (inject_advisory(0x110) or "")))
+    checks.append(("advisory body",
+                   "0x130" in (inject_advisory(0x130) or "")))
+    checks.append(("advisory diag none", inject_advisory(0x7E8) is None))
 
     # ---- controller mapping (pure, no controller needed)
     axes = [0.0, 0.0, -1.0, -1.0, 0.0, 0.0]                # idle: triggers -1
