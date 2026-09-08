@@ -21,7 +21,8 @@ Layout (three non-overlapping columns, per the approved mockup):
   * LEFT  - scrolling road + car sprite (the "game view")
   * MID   - tiled 3x3 instrument cluster (small non-overlapping gauges) + odo
   * RIGHT - warning lamps, live-data table, CAN console + quick inject, controls
-  * FOOTER- keyboard + controller-controller hints and the broadcast-ID legend
+  * FOOTER- keyboard drive hints, panel layout buttons and the
+  *         broadcast-ID legend
 
   * CAN BUS tab - click a line to copy that frame to the clipboard, or
     double-click to load it straight into the CAN INJECT box.
@@ -75,7 +76,7 @@ except Exception:                       # no SDL runtime -> keyboard only
     SDL = None
     _HAS_SDL = False
 
-__version__ = "0.11.0"
+__version__ = "0.9.6"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -146,20 +147,23 @@ def decode_frame(fr):
         if b1 & 0x02:
             lights.append("R")
         if b1 & 0x04:
-            lights.append("HI")
-        if b1 & 0x08:
-            lights.append("HL")
-        if b1 & 0x10:
-            lights.append("WIP")
-        if b1 & 0x20:
             lights.append("HAZ")
+        if b1 & 0x08:
+            lights.append("HI")
+        if b1 & 0x10:
+            lights.append("HL")
+        if b1 & 0x20:
+            lights.append("WIP")
         fields = {
             "steer": f"{s}",
             "lights": ",".join(lights) if lights else "-",
         }
     elif fid == 0x130:                              # body
         b = _byte(data, 0)
-        fields = {"doors": f"{b & 0x0F}", "trunk": "open" if b & 0x10 else "closed",
+        open_doors = [n for i, n in enumerate(("FL", "FR", "RL", "RR"))
+                      if b & (1 << i)]
+        fields = {"doors": ",".join(open_doors) if open_doors else "all closed",
+                  "trunk": "open" if b & 0x10 else "closed",
                   "hood": "open" if b & 0x20 else "closed",
                   "belt": "yes" if b & 0x40 else "no"}
     elif fid == 0x140:                              # gear / fuel / odo
@@ -677,6 +681,7 @@ class Cockpit:
         self._lat_rate = 12.0        # px per render tick at full steer (lane-hold)
         self._prev_frames = {}
         self.frame_history = []
+        self._last_frame_val = {}   # id -> last data (mark changed)
         self._bus_seq = 0
         self._bus_pause = False      # FREEZE the CAN BUS monitor
         self._bus_frozen_at = None   # seq at which the freeze snapshot was taken
@@ -706,6 +711,7 @@ class Cockpit:
         self._last_live = None
         self._pad_prev = (0,) * 16
         self._pad_available = False
+        self._pad_rescan_t = 0.0
 
         self.client = CockpitClient(host, ctrl_port, on_state=self._on_state,
                                     on_log=self._log)
@@ -736,7 +742,17 @@ class Cockpit:
         self._log(f"controller: {self._pad.get_name()} online (USB or radio)")
 
     def _poll_controller(self):
-        if not self._pad_available or not _HAS_SDL:
+        if not _HAS_SDL:
+            return
+        if not self._pad_available:
+            # Hot-plug rescan ~1/s: a pad that connects AFTER launch (controller
+            # over USB or radio) is discovered without restarting the
+            # cockpit.  Disconnects re-arm this path automatically.
+            if time.monotonic() - self._pad_rescan_t >= 1.0:
+                self._pad_rescan_t = time.monotonic()
+                SDL.event.pump()
+                if SDL.controller.get_count() > 0:
+                    self._init_controller()
             return
         SDL.event.pump()
         try:
@@ -790,9 +806,13 @@ class Cockpit:
         # stream (each id updates at its own broadcast period)
         for fr in frames:
             self._bus_seq += 1
+            key = fr.get("id")
+            val = fr.get("data", "")
+            changed = self._last_frame_val.get(key) != val
+            self._last_frame_val[key] = val
             rec = {"ts": time.strftime("%H:%M:%S"),
-                   "id": fr.get("id"), "dlc": fr.get("dlc", 8),
-                   "data": fr.get("data", ""), "n": self._bus_seq}
+                   "id": key, "dlc": fr.get("dlc", 8),
+                   "data": val, "n": self._bus_seq, "changed": changed}
             self.frame_history.append(rec)
             self._rec_frame(rec)
         self.frame_history = self.frame_history[-120:]
@@ -953,32 +973,18 @@ class Cockpit:
                        selectcolor="#1c2733", activebackground="#0b0d10",
                        activeforeground="#ffffff", highlightthickness=0).pack(side="right")
 
-        # ---- row 1: vertical split: CAR band over PANEL band.
-        #      Plain tk grid + custom draggable master sash.  ttk.PanedWindow
-        #      paints an opaque grey band on this theme and hides content, so
-        #      it is deliberately not used here.
-        self._main = tk.Frame(self.root, bg="#0b0d10")
-        self._main.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 4))
-        self._main.columnconfigure(0, weight=1)
-        self._main.rowconfigure(0, weight=3)
-        self._main.rowconfigure(1, weight=0, minsize=6)
-        self._main.rowconfigure(2, weight=2)
+        # ---- row 1: vertical master sash: CAR band over PANEL band
+        self._vp = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
+        self._vp.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 4))
 
-        self._band_car = tk.Frame(self._main, bg="#0b0d10")
-        self._band_car.grid(row=0, column=0, sticky="nsew")
-        self._master_sash = tk.Frame(self._main, bg="#2b3641",
-                                     cursor="sb_v_double_arrow")
-        self._master_sash.grid(row=1, column=0, sticky="ew")
-        self._master_sash.bind("<ButtonPress-1>", self._master_drag_start)
-        self._master_sash.bind("<B1-Motion>", self._master_drag)
-        self._band_pan = tk.Frame(self._main, bg="#0b0d10")
-        self._band_pan.grid(row=2, column=0, sticky="nsew")
+        self._band_car = ttk.Frame(self._vp)
+        self._vp.add(self._band_car, weight=3)
+        self._band_pan = ttk.Frame(self._vp)
+        self._vp.add(self._band_pan, weight=2)
 
         # panel bookkeeping + per-band orientation (side-by-side / stacked)
         self._panels = {}
         self._band_orient = {"car": "horizontal", "pan": "horizontal"}
-        self._sashes = {}
-        self._drag = None
 
         # ---- CAR band: ROAD / GAME VIEW  +  INSTRUMENT CLUSTER
         road = self._panel("car", "ROAD / GAME VIEW", key="road", weight=3)
@@ -996,8 +1002,8 @@ class Cockpit:
         self._build_right()
 
         # grid both bands per their current orientation
-        self._rebuild_band("car")
-        self._rebuild_band("pan")
+        self._relayout_band("car")
+        self._relayout_band("pan")
 
         # ---- row 2: footer / control instructions
         self._build_footer()
@@ -1030,189 +1036,72 @@ class Cockpit:
         body.grid(row=1, column=0, sticky="nsew", pady=(2, 0))
         self._panels[key] = {"band": band, "weight": weight, "outer": outer,
                              "body": body, "min": False, "max": False,
-                             "px": None, "btn_min": btn_min,
-                             "btn_max": btn_max}
+                             "btn_min": btn_min, "btn_max": btn_max}
         return body
 
-    def _allocate_px(self, shown, axis_total, sash_px, min_px):
-        """Compute per-panel pixel sizes along a band's main axis.  Panels the
-        user dragged (p['px']) keep that size; the rest share remaining space
-        proportionally to weight."""
-        n = len(shown)
-        avail = axis_total - sash_px * max(0, n - 1)
-        px = [p.get("px") for p in shown]
-        residual = avail - sum(v for v in px if v)
-        wsum = sum(p["weight"] for p in shown if not p.get("px"))
-        wcnt = sum(1 for p in shown if not p.get("px"))
-        out = []
-        for p, v in zip(shown, px):
-            if v:
-                out.append(int(v))
-            elif wsum:
-                out.append(int(residual * p["weight"] / wsum))
-            elif wcnt:
-                out.append(int(residual / wcnt))
-            else:
-                out.append(int(residual / max(1, n)))
-        if min_px:
-            out = [max(min_px, v) for v in out]
-        return out
-
-    def _rebuild_band(self, band):
-        """(Re)lay a band out on a plain tk grid with custom draggable sash
-        bars -- no ttk.PanedWindow, which paints an opaque grey band on this
-        theme and hides panel content.  Panel OUTER frames persist as band
-        children and are only re-gridded here.  Honours orientation, min/max
-        and per-panel pixel sizes (p['px'])."""
+    def _relayout_band(self, band):
+        """Re-grid every panel in one band for the band's orientation,
+        honouring collapsed (min) and maximized (max) states."""
         bandf = self._band_car if band == "car" else self._band_pan
-        orient = self._band_orient.get(band, "horizontal")
         items = [p for p in self._panels.values() if p["band"] == band]
-        mp = next((p for p in items if p["max"]), None)
-
-        for s in self._sashes.get(band, []):
-            try:
-                s.destroy()
-            except Exception:
-                pass
-        self._sashes[band] = []
-
-        for i in range(32):
-            bandf.grid_columnconfigure(i, weight=0, minsize=0)
-            bandf.grid_rowconfigure(i, weight=0, minsize=0)
-
-        if mp is not None:
+        for i in range(len(items) + 2):
+            bandf.grid_columnconfigure(i, weight=0)
+            bandf.grid_rowconfigure(i, weight=0)
+        maxed = [p for p in items if p["max"]]
+        if maxed:
+            p = maxed[0]
+            for q in items:
+                if q is p:
+                    q["outer"].grid(row=0, column=0, sticky="nsew")
+                else:
+                    q["outer"].grid_remove()
             bandf.grid_rowconfigure(0, weight=1)
             bandf.grid_columnconfigure(0, weight=1)
-            for p in items:
-                if p is mp:
-                    p["outer"].grid(row=0, column=0, sticky="nsew")
-                    p["body"].grid(row=1, column=0, sticky="nsew", pady=(2, 0))
-                else:
-                    p["outer"].grid_remove()
-            self.root.update_idletasks()
-            return
-
-        shown = [p for p in items if not p["min"]]
-        vis_n = len(shown)
-
-        if orient == "horizontal":
-            bandf.grid_rowconfigure(0, weight=1)
-            total = bandf.winfo_width() or 960
-            px = self._allocate_px(shown, total, 6, 160)
-            for i, p in enumerate(shown):
-                col = i * 2
-                p["outer"].grid(row=0, column=col, sticky="nsew")
-                if p.get("px"):
-                    bandf.grid_columnconfigure(col, weight=0, minsize=px[i])
-                else:
-                    bandf.grid_columnconfigure(col, weight=p["weight"], minsize=0)
-                if i < vis_n - 1:
-                    s = tk.Frame(bandf, bg="#2b3641",
-                                 cursor="sb_h_double_arrow", width=6)
-                    s.grid(row=0, column=col + 1, sticky="ns")
-                    bandf.grid_columnconfigure(col + 1, weight=0, minsize=6)
-                    s.bind("<ButtonPress-1>",
-                           lambda e, b=band, idx=i: self._band_drag_start(b, idx, e))
-                    s.bind("<B1-Motion>",
-                           lambda e, b=band, idx=i: self._band_drag(b, idx, e))
-                    self._sashes[band].append(s)
         else:
-            bandf.grid_columnconfigure(0, weight=1)
-            total = bandf.winfo_height() or 600
-            px = self._allocate_px(shown, total, 6, 90)
-            for i, p in enumerate(shown):
-                row = i * 2
-                p["outer"].grid(row=row, column=0, sticky="nsew")
-                if p.get("px"):
-                    bandf.grid_rowconfigure(row, weight=0, minsize=px[i])
-                else:
-                    bandf.grid_rowconfigure(row, weight=p["weight"], minsize=0)
-                if i < vis_n - 1:
-                    s = tk.Frame(bandf, bg="#2b3641",
-                                 cursor="sb_v_double_arrow", height=6)
-                    s.grid(row=row + 1, column=0, sticky="ew")
-                    bandf.grid_rowconfigure(row + 1, weight=0, minsize=6)
-                    s.bind("<ButtonPress-1>",
-                           lambda e, b=band, idx=i: self._band_drag_start(b, idx, e))
-                    s.bind("<B1-Motion>",
-                           lambda e, b=band, idx=i: self._band_drag(b, idx, e))
-                    self._sashes[band].append(s)
-
+            orient = self._band_orient.get(band, "horizontal")
+            n = len(items)
+            if orient == "horizontal":
+                bandf.grid_rowconfigure(0, weight=1)
+                for i, p in enumerate(items):
+                    w = 0 if p["min"] else p["weight"]
+                    p["outer"].grid(row=0, column=i, sticky="nsew",
+                                    padx=(0, 4) if i < n - 1 else (0, 0))
+                    bandf.grid_columnconfigure(i, weight=w)
+            else:
+                bandf.grid_columnconfigure(0, weight=1)
+                for i, p in enumerate(items):
+                    w = 0 if p["min"] else p["weight"]
+                    p["outer"].grid(row=i, column=0, sticky="nsew",
+                                    pady=(0, 4) if i < n - 1 else (0, 0))
+                    bandf.grid_rowconfigure(i, weight=w)
         for p in items:
             if p["min"]:
-                p["outer"].grid_remove()
                 p["body"].grid_remove()
             else:
                 p["body"].grid(row=1, column=0, sticky="nsew", pady=(2, 0))
         self.root.update_idletasks()
 
-    def _band_drag_start(self, band, idx, e):
-        shown = [p for p in self._panels.values()
-                 if p["band"] == band and not p["min"]]
-        if idx >= len(shown):
-            return
-        p = shown[idx]
-        horiz = self._band_orient.get(band) == "horizontal"
-        self._drag = {"band": band, "idx": idx,
-                      "x0": e.x_root, "y0": e.y_root,
-                      "val0": p["outer"].winfo_width() if horiz
-                      else p["outer"].winfo_height()}
-
-    def _band_drag(self, band, idx, e):
-        d = self._drag
-        if not d or d["band"] != band or d["idx"] != idx:
-            return
-        shown = [p for p in self._panels.values()
-                 if p["band"] == band and not p["min"]]
-        if idx >= len(shown):
-            return
-        p = shown[idx]
-        bandf = self._band_car if band == "car" else self._band_pan
-        n = len(shown)
-        if self._band_orient.get(band) == "horizontal":
-            total = bandf.winfo_width() or 960
-            delta = e.x_root - d["x0"]
-            val = max(160, min(total - 160 * (n - 1) - 6 * (n - 1),
-                               d["val0"] + delta))
-        else:
-            total = bandf.winfo_height() or 600
-            delta = e.y_root - d["y0"]
-            val = max(90, min(total - 90 * (n - 1) - 6 * (n - 1),
-                              d["val0"] + delta))
-        p["px"] = int(val)
-        self._rebuild_band(band)
-
     def _panel_min(self, key):
         p = self._panels[key]
         p["min"] = not p["min"]
         p["btn_min"].configure(text="+" if p["min"] else "-")
-        self._rebuild_band(p["band"])
+        self._relayout_band(p["band"])
         self._log("panel %s %s" % (key, "minimized - click [+] to expand"
                                   if p["min"] else "expanded"))
 
     def _panel_max(self, key):
         p = self._panels[key]
-        if p["max"]:
-            p["max"] = False
-        else:
-            for q in self._panels.values():
-                if q["band"] == p["band"]:
-                    q["max"] = False
-                    q["btn_max"].configure(text="M")
-            p["max"] = True
+        p["max"] = not p["max"]
         p["btn_max"].configure(text="R" if p["max"] else "M")
-        self._rebuild_band(p["band"])
-        self._log("panel %s %s" % (key, "maximized - click R to restore"
-                                  if p["max"] else "restored"))
+        self._relayout_band(p["band"])
+        self._log("panel %s %s" % (key, "maximized" if p["max"] else "restored"))
 
     def _panel_orient(self, orient):
         orient = "vertical" if orient == "vertical" else "horizontal"
         self._band_orient["car"] = orient
         self._band_orient["pan"] = orient
-        for p in self._panels.values():
-            p["px"] = None
-        self._rebuild_band("car")
-        self._rebuild_band("pan")
+        self._relayout_band("car")
+        self._relayout_band("pan")
         self._log("layout %s" % ("stacked" if orient == "vertical"
                                  else "side-by-side"))
 
@@ -1233,41 +1122,9 @@ class Cockpit:
         80 ms after the UI is built)."""
         try:
             self.root.update_idletasks()
-            h = self._main.winfo_height()
+            h = self._vp.winfo_height()
             if h > 200:
-                self._set_master_split(int(h * 0.45))
-        except Exception:
-            pass
-
-    def _set_master_split(self, car_px):
-        """Set the CAR/PANEL vertical split (CAR band in pixels).  Uses grid
-        weights so both bands keep tracking window resizes."""
-        try:
-            self.root.update_idletasks()
-            h = self._main.winfo_height()
-            car = int(max(120, min(h - 140, car_px)))
-            pan = max(1, h - car - 6)
-            self._main.rowconfigure(0, weight=car)
-            self._main.rowconfigure(2, weight=pan)
-            self._main.rowconfigure(1, weight=0, minsize=6)
-            self.root.update_idletasks()
-        except Exception:
-            pass
-
-    def _master_drag_start(self, e):
-        self._drag = {"band": None, "idx": None,
-                      "x0": e.x_root, "y0": e.y_root,
-                      "val0": self._band_car.winfo_height()}
-
-    def _master_drag(self, e):
-        d = self._drag
-        if not d or d["band"] is not None:
-            return
-        try:
-            h = self._main.winfo_height()
-            delta = e.y_root - d["y0"]
-            car = max(120, min(h - 140, d["val0"] + delta))
-            self._set_master_split(int(car))
+                self._vp.sashpos(0, int(h * 0.45))
         except Exception:
             pass
 
@@ -1294,19 +1151,6 @@ class Cockpit:
                                                           fill="x", expand=True)
         ttk.Button(row, text="SEND", command=self._send_inject).pack(side="left",
                                                                      padx=(4, 0))
-        q = ttk.Frame(cframe)
-        q.pack(fill="x", padx=4, pady=(0, 3))
-        qbtn = [("THROTTLE +", self._q_throttle_plus),
-                ("BRAKE +", self._q_brake_plus),
-                ("GEAR D", self._q_gear_d),
-                ("REVERSE", self._q_reverse),
-                ("STEER +", self._q_steer_plus),
-                ("STEER -", self._q_steer_minus),
-                ("CANCEL", self._q_cancel)]
-        for i, (t, c) in enumerate(qbtn):
-            ttk.Button(q, text=t, command=c).grid(
-                row=i // 4, column=i % 4, padx=2, pady=2, sticky="ew")
-
         # ---------------- CAN BUS  (pane 1, widest; monitor + FREEZE)
         canbus = self._panel("pan", "CAN BUS", key="canbus", weight=2)
         canbus.columnconfigure(0, weight=1)
@@ -1363,7 +1207,7 @@ class Cockpit:
         busrow.rowconfigure(0, weight=1)
         self.bus_txt = tk.Text(busrow, bg="#0a0a0a", fg="#cfd8e0",
                                font=("Consolas", 8), relief="flat", padx=4,
-                               pady=2, wrap="none")
+                               pady=2, wrap="char")
         self.bus_sb = ttk.Scrollbar(busrow, orient="vertical",
                                     command=self._bus_sb_cmd)
         self.bus_sb_h = ttk.Scrollbar(busrow, orient="horizontal",
@@ -1433,11 +1277,24 @@ class Cockpit:
         swf = ttk.LabelFrame(service, text="Switches")
         swf.grid(row=8, column=0, columnspan=4, sticky="ew", pady=5)
         self.sw_checks = {}
-        for i, name in enumerate(("headlights", "wipers", "hazard", "parkbrake")):
-            v = tk.BooleanVar(value=False)
-            cb = ttk.Checkbutton(swf, text=name, variable=v,
+        sw_defs = (
+            ("headlights", "HEADLIGHT", False),
+            ("wipers", "WIPERS", False),
+            ("hazard", "HAZARD", False),
+            ("parkbrake", "PARK BRAKE", False),
+            ("door_fl", "DOOR FL", False),
+            ("door_fr", "DOOR FR", False),
+            ("door_rl", "DOOR RL", False),
+            ("door_rr", "DOOR RR", False),
+            ("trunk", "TRUNK", False),
+            ("hood", "HOOD", False),
+            ("seatbelt", "BELT", True),
+        )
+        for i, (name, label, default) in enumerate(sw_defs):
+            v = tk.BooleanVar(value=default)
+            cb = ttk.Checkbutton(swf, text=label, variable=v,
                                  command=lambda n=name, v=v: self._switch3(n, v))
-            cb.grid(row=i // 2, column=i % 2, sticky="w", padx=4, pady=2)
+            cb.grid(row=i // 3, column=i % 3, sticky="w", padx=4, pady=2)
             self.sw_checks[name] = v
         ftf = ttk.LabelFrame(service, text="Faults")
         ftf.grid(row=9, column=0, columnspan=4, sticky="ew", pady=5)
@@ -1476,6 +1333,9 @@ class Cockpit:
         self.bus_txt.delete("1.0", "end")
         self.bus_txt.tag_configure("capture", background="#26313d",
                                    foreground="#ffffff")
+        self.bus_txt.tag_configure("tx", foreground="#ffd60a")
+        self.bus_txt.tag_configure("chg", background="#17323d",
+                                   foreground="#34d1ce")
         for rec in view:
             try:
                 dec = decode_frame(rec)
@@ -1489,6 +1349,12 @@ class Cockpit:
                 line = (f"{rec.get('ts', '')}  {rec.get('id', '?'):#x} "
                         f"{rec.get('data', '')}")
             self.bus_txt.insert("end", line + "\n")
+            if rec.get("tx"):
+                self.bus_txt.tag_add("tx", "end-%dc" % (len(line) + 1),
+                                     "end-1c")
+            elif rec.get("changed"):
+                self.bus_txt.tag_add("chg", "end-%dc" % (len(line) + 1),
+                                     "end-1c")
         self.bus_txt.configure(state="disabled")
         if tail:
             self.bus_txt.see("end")
@@ -1600,20 +1466,14 @@ class Cockpit:
         tk.Label(prow, text="[-] collapse   [M] maximize   R restore",
                  bg="#101418", fg="#5c6a76", font=("Consolas", 8),
                  anchor="w").pack(side="left", padx=(10, 0))
+
         # Primary drive row: larger + amber so the arrow keys are legible.
         tk.Label(f, text="DRIVE   W/↑ gas   S/↓ brake   A/← steer L   D/→ steer R",
                  bg="#101418", fg="#ffd60a", font=("Consolas", 11),
                  anchor="w").pack(fill="x")
         kb = ("KEYBOARD   P R N D gear   I IGNITION   SPACE parkbrake   "
               "H hazards   C cruise   +/- set   A autopilot   U units   R reset")
-        xb = ("controller   LS steer   RS gas/brake   LT/RT gas·brake   A D   B N   "
-              "X parkbrake   Y reset   LB/RB P·D   BACK hazards   START ignition   "
-              "C autopilot")
         tk.Label(f, text=kb, bg="#101418", fg="#d7e2ea",
-                 font=("Consolas", 9), anchor="w").pack(fill="x")
-        gp = "controller: n/a (keyboard only)" if not _HAS_SDL else \
-             ("controller: ONLINE" if self._pad_available else "controller: none connected")
-        tk.Label(f, text=xb + "   [" + gp + "]", bg="#101418", fg="#d7e2ea",
                  font=("Consolas", 9), anchor="w").pack(fill="x")
         tk.Label(f, text="Bus broadcast / drive IDs       0x100 ENG   0x110 CHAS   "
                           "0x120 STEER+lights   0x130 BODY   0x140 GEAR/fuel/odo   "
@@ -1632,46 +1492,6 @@ class Cockpit:
                 adv = inject_advisory(parsed[0])
                 if adv:
                     self._log("note " + adv)
-
-    def _q_inject(self, fid, data):
-        if self.injector.send_frame(fid, data):
-            self._log(f"inj {fid:03X}#{data.hex().upper()}")
-            self._log_tx(fid, data, src="quick inject")
-        else:
-            self._log("inj FAIL: injector offline")
-
-    def _q_throttle_plus(self):
-        cur = self._state.get("throttle", 0.0)
-        fid, d = build_drive(throttle=min(1.0, cur + 0.2),
-                             brake=self._state.get("brake", 0.0),
-                             gear=self._state.get("gear", "D"),
-                             steer=self._state.get("steer", 0.0) / 100.0)
-        self._q_inject(fid, d)
-
-    def _q_brake_plus(self):
-        cur = self._state.get("brake", 0.0)
-        fid, d = build_drive(throttle=self._state.get("throttle", 0.0),
-                             brake=min(1.0, cur + 0.2),
-                             gear=self._state.get("gear", "D"),
-                             steer=self._state.get("steer", 0.0) / 100.0)
-        self._q_inject(fid, d)
-
-    def _q_gear_d(self):
-        self._q_inject(*build_drive(gear="D"))
-
-    def _q_reverse(self):
-        self._q_inject(*build_drive(gear="R"))
-
-    def _q_steer_plus(self):
-        cur = self._state.get("steer", 0.0) / 100.0
-        self._q_inject(*build_drive(steer=min(1.0, cur + 0.15)))
-
-    def _q_steer_minus(self):
-        cur = self._state.get("steer", 0.0) / 100.0
-        self._q_inject(*build_drive(steer=max(-1.0, cur - 0.15)))
-
-    def _q_cancel(self):
-        self._q_inject(*build_drive(throttle=0.0, brake=0.0, gear="D", steer=0.0))
 
     def _bind_keys(self):
         self.root.bind("<KeyPress-Up>", lambda e: self._key_thr(1.0))
@@ -1771,6 +1591,18 @@ class Cockpit:
 
     def _switch_tx(self, name, on):
         """Synthetic TX for the broadcast frame that carries this switch."""
+        body_names = ("door_fl", "door_fr", "door_rl", "door_rr")
+        if name in body_names or name in ("trunk", "hood", "seatbelt"):
+            bits = 0x00
+            for i, n in enumerate(body_names):
+                if n in self.sw_checks and self.sw_checks[n].get():
+                    bits |= 1 << i
+            for n, m in (("trunk", 0x10), ("hood", 0x20), ("seatbelt", 0x40)):
+                if n in self.sw_checks and self.sw_checks[n].get():
+                    bits |= m
+            self._log_tx(0x130, bytes([bits, 0, 0, 0, 0, 0, 0, 0]),
+                         src=f"sw {name} {'ON' if on else 'OFF'}")
+            return
         if name == "parkbrake":
             self._log_tx(*build_realistic_0x110(
                 speed_kmh=float(self._state.get("speed", 0.0)),
@@ -1778,7 +1610,7 @@ class Cockpit:
                 flags=0x08 if on else 0),
                 src=f"sw {name} {'ON' if on else 'OFF'}")
             return
-        lamps = {"headlights": 0x04, "wipers": 0x10, "hazard": 0x20}.get(
+        lamps = {"headlights": 0x10, "wipers": 0x20, "hazard": 0x04}.get(
             name, 0x01)
         self._log_tx(*build_realistic_0x120(
             steer=float(self._state.get("steer", 0.0)) / 100.0,
@@ -1787,11 +1619,54 @@ class Cockpit:
 
     def _fault3(self, name, var):
         self.client.send({"t": "fault", "name": name, "on": var.get()})
+        self._fault_tx(name, var.get())
+
+    def _fault_tx(self, name, on):
+        """Synthetic diagnostic frame for the CAN BUS monitor, mirroring
+        byte-for-byte the sim's OBD answer to a scan read right after this
+        fault change (see sim handle_request() / handle_rx_frame() sf path:
+        ISO-TP single-frame PCI prefix + zero pad to 8).
+
+          mil/overheat/flat -> mode 03 stored-DTC list, engine ECU 0x7E8
+          abs               -> UDS 19 02 report-by-status, ABS ECU 0x7EA
+
+        flat() has no DTC (FAULT_DTCS['flat'] == []) so its frame re-reports
+        the current engine code list - the toggle still shows up as a TX row.
+        Engine codes use the sim's own iteration order (mil then overheat)."""
+        f = self.fl_checks
+        if name == "abs":
+            body = (b"\x59\x02\xFF\x40\x35\x08" if (on or f["abs"].get())
+                    else b"\x59\x02\xFF")          # C0035 / none stored
+            fid = 0x7EA
+        else:
+            order = ("mil", "overheat")              # mirrors engine_dtcs()
+            hilo = {"mil": (0x03, 0x00),             # P0300
+                    "overheat": (0x02, 0x17)}        # P0217
+            active = [n for n in order
+                      if (f[n].get() if n != name else on)]
+            pairs = b"".join(bytes(hilo[n]) for n in active)
+            body = bytes([0x43, len(active)]) + pairs
+            fid = 0x7E8
+        frm = bytes([len(body)]) + body              # ISO-TP single frame
+        self._log_tx(fid, frm + b"\x00" * (8 - len(frm)),
+                     src=f"fault {name} {'SET' if on else 'CLEAR'}")
 
     def _clear_faults(self):
+        had_eng = had_abs = False
         for name, v in self.fl_checks.items():
+            if v.get():
+                had_eng |= name != "abs"
+                had_abs |= name == "abs"
             v.set(False)
             self.client.send({"t": "fault", "name": name, "on": False})
+        if had_eng:                                  # mode 03: 0 DTCs stored
+            frm = b"\x02\x43\x00"
+            self._log_tx(0x7E8, frm + b"\x00" * (8 - len(frm)),
+                         src="fault clear-all (engine 0 DTCs)")
+        if had_abs:                                  # UDS 19 02: none stored
+            frm = b"\x03\x59\x02\xFF"
+            self._log_tx(0x7EA, frm + b"\x00" * (8 - len(frm)),
+                         src="fault clear-all (ABS 0 DTCs)")
         self._log("all faults cleared")
 
     def _toggle_units(self):
