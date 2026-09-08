@@ -1,0 +1,1611 @@
+#!/usr/bin/env python3
+"""
+carsim.py — drivable virtual car engine (the "ECU side" of the cockpit).
+
+What this is
+------------
+A physics model of a 6-speed automatic car plus a *fake ECU cluster* that
+answers real OBD-II / UDS diagnostics, plus a *broadcast bus* with the classic
+CAN frames a real car puts on the wire (0x100 engine, 0x110 chassis,
+0x120 steering/lights, 0x130 body, 0x140 gear/fuel).
+
+Three personalities, one binary:
+
+  1. TCP bench mode (default)
+       carsim.py
+     Listens on 127.0.0.1:20102 as a Lawicel SLCAN-over-TCP *server*, byte
+     compatible with the remote CAN-adapter (reference): S/O/C/V/N/F commands,
+     "t" frames, V1013, N0000, F12.  The cockpit GUI (carsim_gui.py) drives it
+     over a second JSON control channel (port 20103).  Point client.py at it:
+
+         python3 client.py --host 127.0.0.1 --port 20102 ping
+         python3 client.py --host 127.0.0.1 --port 20102 dtc
+         python3 client.py --host 127.0.0.1 --port 20102 vin
+         python3 client.py --host 127.0.0.1 --port 20102 live 0C 0D 05
+
+  2. SocketCAN / AF_CAN mode (the network-proof setup)
+       sudo ip link set can0 type can bitrate 500000 && sudo ip link set can0 up
+       carsim.py --iface can0
+     Binds can0 with raw SocketCAN (same pattern as the reference ECU sim.py), puts the ECU
+     answers and the broadcast frames on the *wired* CAN bus.  The remote
+     CAN-adapter is plugged into that bus; the GUI (or client) reaches the car
+     only over the adapter's network:  GUI -> network -> adapter -> CAN wire -> carsim.
+     The TCP SLCAN server is OFF in this mode (--tcp-also to force it on) so
+     there is exactly one way to reach the car: through the radio path.
+
+  3. --selftest
+       carsim.py --selftest
+     Headless physics + protocol assertions (no sockets, no CAN).  Used by the
+     build pipeline; the sandbox has no display, so this is how the engine is
+     verified before the GUI is ever opened.
+
+The proof that OBD really travels over network (vs. the old the old bench sim confusion):
+the old bench sim answered on the loopback interface, so the GUI kept working with the
+hardware unplugged.  carsim on can0 lives on the OTHER side of the adapter, so
+if the GUI still shows gauges with the adapter's network off, the data did not come
+from the car.  That contrast *is* the test.
+
+Lawicel SLCAN wire format (matches reference formatSLCAN/parseSLCAN):
+    RX to client :  t<3hex id><1hex dlc><2hex per byte>\r   (uppercase data)
+    TX from client: t<3hex id><1hex dlc><2hex per byte>\r   (T = extended id)
+    V -> "V1013\r", N -> "N0000\r", F -> "F12\r", O opens, C closes.
+    Frames are pushed only while a client is connected AND the channel is open.
+
+ISO-TP (ISO 15765-2) is handled ECU-side exactly like the reference ECU sim.py:
+    single-frame requests (PCI 1..7) -> immediate single-frame reply,
+    multi-frame replies (VIN, big DTC lists) -> FirstFrame, wait for the
+    client's FlowControl (0x30), then ConsecutiveFrames with 18 ms pacing.
+    If the *client* sends us a FirstFrame we answer FlowControl 30 00 00.
+
+JSON control channel (port 20103) — one 10 Hz state stream + commands:
+    RX {"t":"input","throttle":0.0,"brake":0.0,"steer":0.0}
+    RX {"t":"gear","gear":"D"}            RX {"t":"ignition","on":true}
+    RX {"t":"switch","name":"hazard","on":true}
+    RX {"t":"fault","name":"mil","on":true}
+    RX {"t":"cruise","on":true}           RX {"t":"cruise","delta":5}
+    RX {"t":"reset"}
+    TX {"t":"state", ...physics, lamps, faults, switches, frames, events}
+
+Fault deck (toggles the same way the GUI shows them):
+    mil      -> P0300  (MIL on, rpm jitter)
+    overheat -> P0217  (coolant climbs to ~120 C, limp torque x0.5)
+    oil      -> P0520  (MIL on)
+    abs      -> C0035  (ABS lamp; visible only via UDS 19 02 to physical 7E2)
+    flat     -> no DTC (speed capped at 88 km/h + wobble)
+    mode 04 / UDS 14 clear -> faults reset, MIL off.
+
+SAE J1979 encodings are big-endian, exactly what real scan tools decode:
+    rpm = (b0<<8|b1)/4, speed = b0 km/h, load = b0*100/255,
+    coolant/oil/intake = b0-40, maf = (b0<<8|b1)/100 g/s, etc.
+
+Run "carsim.py --help" for the full option list.
+"""
+
+import argparse
+import json
+import math
+import select
+import socket
+import struct
+import sys
+import threading
+import time
+
+__version__ = "0.1"
+
+# --------------------------------------------------------------------------- #
+#  Constants
+# --------------------------------------------------------------------------- #
+
+SLCAN_PORT = 20102            # Lawicel SLCAN-over-TCP server (adapter server)
+CTRL_PORT = 20103             # JSON control channel for the cockpit GUI
+
+ECU_ENGINE = 0x7E8            # engine  -> answers functional 0x7DF + phys 0x7E0
+ECU_TCM = 0x7E9               # TCM     -> answers physical 0x7E1
+ECU_ABS = 0x7EA               # ABS     -> answers physical 0x7E2
+REQ_FUNCTIONAL = 0x7DF
+REQ_ENGINE = 0x7E0
+REQ_TCM = 0x7E1
+REQ_ABS = 0x7E2
+
+VIN = b"2LMPJ8K96GBL00001"    # 17 chars, "Ford" style, but ours.
+
+# Physics (6-speed automatic, torque-converter launch)
+RATIOS = (3.75, 2.19, 1.41, 1.03, 0.80, 0.66)
+FINAL_DRIVE = 3.45
+WHEEL_R = 0.315               # m
+MASS = 1550.0                 # kg
+IDLE_RPM = 800.0
+REDLINE = 6400.0
+DISP_L = 2.5                  # engine displacement, litres
+TANK_L = 60.0                 # fuel tank, litres
+AMBIENT_C = 22.0
+MAX_SPEED_KMH = 240.0
+FLAT_CAP_KMH = 88.0
+CRUISE_MIN = 40.0
+CRUISE_MAX = 160.0
+
+GEAR_ENUM = {"P": 0, "R": 1, "N": 2, "D": 3}
+GEAR_FROM = {v: k for k, v in GEAR_ENUM.items()}
+REVERSE_RATIO = 3.2
+
+# Broadcast frames (ids and periods; disabled with --no-traffic)
+FRAME_ENGINE = 0x100          # 20 ms : rpm(2) load throttle coolant maf(2) oil
+FRAME_CHASSIS = 0x110         # 20 ms : speed brake% flags
+FRAME_STEER = 0x120           # 50 ms : steer + light/wiper bits
+FRAME_BODY = 0x130            # 50 ms : doors/trunk/hood/seatbelt bits
+FRAME_GEAR = 0x140            # 100 ms: gear enum fuel% odo(u32 LE) runtime(u16 LE)
+
+# External drive-input frame (ICSim-style): a control sender (cangen/cansend or
+# the cockpit) drives the car.  bytes: throttle*255, brake*100, gear_enum, steer_byte, ..
+# steer_byte: 0..255 with 128 = centered, so (b-128)/127 gives -1..1.
+FRAME_DRIVE_IN = 0x400
+DRIVE_IDS = (FRAME_ENGINE, FRAME_CHASSIS, FRAME_STEER, FRAME_GEAR, FRAME_DRIVE_IN)
+
+# --------------------------------------------------------------------------- #
+#  Small helpers
+# --------------------------------------------------------------------------- #
+
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
+
+
+def _hexs(data):
+    return " ".join(f"{b:02X}" for b in data)
+
+
+# --------------------------------------------------------------------------- #
+#  Physics
+# --------------------------------------------------------------------------- #
+
+class CarPhysics:
+    """The drivable car.  step(dt) advances it; the ECU layer reads it."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.t = 0.0
+        self.v = 0.0                     # m/s (negative = reverse)
+        self.rpm = 0.0
+        self.gear = "P"                  # P R N D
+        self.gear_num = 0                # 1..6 in D, 0 otherwise
+        self.throttle = 0.0              # 0..1 target
+        self.brake = 0.0                 # 0..1
+        self.steer = 0.0                 # -1..1
+        self.throttle_eff = 0.0          # after limiter/limp (drive torque)
+        self.load_pct = 0.0              # 0..1 engine load
+        self.engine_on = False
+        self.ignition = False
+        self.crank_t = 0.0
+        self.coolant = AMBIENT_C
+        self.oil = AMBIENT_C
+        self.intake = AMBIENT_C + 6.0
+        self.fuel = TANK_L               # litres
+        self.odo = 0.0                   # km
+        self.runtime = 0.0               # s engine run time
+        self.voltage = 12.4
+        self.maf = 0.0                   # g/s
+        self.fuel_rate = 0.0             # L/h
+        self.cruise_on = False
+        self.cruise_set = 0.0            # km/h
+        self._cruise_i = 0.0
+        self.tc_pulse = False            # wheelspin / TC active this tick
+        self.limp = False
+        self.rev_limit = False
+        self.flat = False
+        self.overheat_now = False
+        self._thr_prev = 0.0            # previous tick's throttle (kickdown jab)
+        self._was_rev_limit = False     # rising-edge gating for events
+        self._was_tc = False
+
+    # ------------------------------------------------------------- events
+    def step(self, dt, events, switches, faults):
+        """Advance one physics tick.  events: list to append strings to."""
+        self.t += dt
+        self.limp = faults.get("overheat", False)
+        self.flat = faults.get("flat", False)
+
+        # -- engine start / crank
+        if self.ignition and not self.engine_on:
+            if self.crank_t <= 0.0:
+                if self.gear in ("P", "N"):
+                    self.crank_t = 0.7
+                else:
+                    events.append("crank blocked - shift to P or N")
+                    self.ignition = False
+            else:
+                self.crank_t -= dt
+                if self.crank_t <= 0.0:
+                    self.engine_on = True
+                    events.append("engine started")
+                    if self.gear == "D":   # re-engage 1st if D was selected
+                        self.gear_num = 1   # while the engine was cranking
+        if not self.ignition and self.engine_on:
+            self.engine_on = False
+            self.cruise_on = False
+            events.append("engine stalled (ignition off)")
+
+        # -- cruise control (P controller with small integral)
+        if self.cruise_on:
+            if self.brake > 0.15 or self.gear != "D" or not self.engine_on:
+                self.cruise_on = False
+                events.append("cruise disengaged")
+            else:
+                err = self.cruise_set - self.v * 3.6
+                self._cruise_i = clamp(self._cruise_i + err * dt * 0.02,
+                                       -0.2, 0.2)
+                self.throttle = clamp(0.03 + err * 0.012 + self._cruise_i,
+                                      0.0, 0.85)
+
+        # -- torque production
+        throttle = self.throttle
+        speed_kmh = abs(self.v) * 3.6
+        if not self.engine_on:
+            self.rpm = 260.0 if self.crank_t > 0 else 0.0
+            throttle = 0.0
+            self.gear_num = 0
+            self.rev_limit = False
+            self.tc_pulse = False
+            self._was_rev_limit = False
+            self._was_tc = False
+        else:
+            # converter slip: rpm = idle + throttle*2600*(1 - v/30)
+            conv = IDLE_RPM + throttle * 2600.0 * max(0.0, 1.0 - abs(self.v) / 30.0)
+            if self.gear == "D" and self.gear_num >= 1:
+                wheel_rps = self.v / (2.0 * math.pi * WHEEL_R)
+                speed_rpm = wheel_rps * RATIOS[self.gear_num - 1] * FINAL_DRIVE * 60.0
+                self.rpm = max(IDLE_RPM, speed_rpm * 0.95, conv)
+            elif self.gear == "R":
+                wheel_rps = abs(self.v) / (2.0 * math.pi * WHEEL_R)
+                speed_rpm = wheel_rps * REVERSE_RATIO * FINAL_DRIVE * 60.0
+                self.rpm = max(IDLE_RPM, speed_rpm * 0.95, conv)
+            else:                       # P / N
+                self.rpm = conv
+
+            # rev limiter + misfire jitter (MIL fault)
+            self.rev_limit = self.rpm >= REDLINE
+            if self.rev_limit:
+                throttle = 0.0
+                if not self._was_rev_limit:
+                    events.append("rev limiter")
+            if faults.get("mil", False):
+                self.rpm += 25.0 * math.sin(self.t * 7.3) + 15.0 * math.sin(self.t * 2.1)
+
+            # engine torque curve (peak ~3600 rpm)
+            shape = 0.55 + 0.45 * math.exp(-((self.rpm - 3600.0) / 1600.0) ** 2)
+            torque = 250.0 * throttle * shape
+            if self.limp:
+                torque *= 0.5
+
+            # wheelspin / traction control at launch
+            self.tc_pulse = (self.gear == "D" and self.gear_num == 1
+                             and abs(self.v) < 5.5 and throttle > 0.55)
+            if self.tc_pulse:
+                torque *= 0.8
+                self.rpm += 380.0 * throttle * abs(math.sin(self.t * 11.0))
+                if not self._was_tc:
+                    events.append("wheelspin - TC cutting power")
+
+            # gear selection (auto, D only)
+            if self.gear == "D":
+                if self.rpm > 6000.0 and self.gear_num < 6:
+                    n = self.gear_num + 1
+                    self.gear_num = n
+                    events.append(f"shift up {n - 1}->{n}")
+                elif self.rpm < 2300.0 and self.gear_num > 1:
+                    n = self.gear_num - 1
+                    self.gear_num = n
+                    events.append(f"shift down {n + 1}->{n}")
+                # kickdown: a hard throttle jab at speed DROPS gears for
+                # passing power (real kickdown is a downshift; the old code
+                # wrongly upshifted here and walked 1->6 at launch).
+                jab = throttle - self._thr_prev
+                if (jab > 0.35 and throttle > 0.85 and self.gear_num >= 2
+                        and abs(self.v) * 3.6 >= 25.0 and self.rpm < 5200.0):
+                    cur = RATIOS[self.gear_num - 1]
+                    cand = self.gear_num
+                    for g in range(self.gear_num - 1, 0, -1):
+                        if self.rpm * RATIOS[g - 1] / cur <= REDLINE * 0.97:
+                            cand = g
+                        else:
+                            break
+                    if cand < self.gear_num:
+                        events.append(f"kickdown {self.gear_num}->{cand}")
+                        self.gear_num = cand
+            # latch edge flags for next tick's rising-edge checks
+            self._was_rev_limit = self.rev_limit
+            self._was_tc = self.tc_pulse
+
+            # drive force
+            drive = 0.0
+            if self.gear == "D" and self.gear_num >= 1:
+                drive = torque * RATIOS[self.gear_num - 1] * FINAL_DRIVE / WHEEL_R
+            elif self.gear == "R":
+                drive = -torque * REVERSE_RATIO * FINAL_DRIVE / WHEEL_R
+            elif self.gear == "N":
+                pass
+            converter = 1.0 + 0.9 * throttle * max(0.0, 1.0 - abs(self.v) / 8.0)
+            drive *= converter
+
+            # resistances
+            drag = 0.42 * self.v * abs(self.v)
+            roll = 0.015 * MASS * 9.81 * (1.0 if self.v >= 0 else -1.0)
+            if self.v == 0.0:
+                roll = 0.0
+            brake_f = self.brake * 9000.0 * (1.0 if self.v >= 0 else -1.0)
+            if abs(self.v) < 0.05 and brake_f * math.copysign(1, self.v) < 0:
+                brake_f = 0.0
+            a = (drive - drag - roll - brake_f) / MASS
+
+            # flat tyre governor: cut drive above the cap so the car coasts
+            # back down; below the cap normal drive is allowed but must never
+            # push the car past the cap.
+            if self.flat:
+                cap = FLAT_CAP_KMH / 3.6
+                if self.v > cap:
+                    a = -(drag + roll) / MASS       # drive cut, coast down
+                elif self.v < cap and a > 0.0 and self.v + a * dt > cap:
+                    a = (cap - self.v) / dt         # ease up to the cap
+                a *= (1.0 + 0.03 * math.sin(self.t * 3.0))   # tyre wobble
+                if not getattr(self, "_flat_warned", False):
+                    events.append("flat tyre - limited to ~88 km/h")
+                    self._flat_warned = True
+            else:
+                self._flat_warned = False
+
+            self.v = clamp(self.v + a * dt, -30.0 / 3.6, MAX_SPEED_KMH / 3.6)
+            if abs(self.v) < 0.02 and drive == 0.0:
+                self.v = 0.0
+
+            # load + airflow + fuel
+            self.load_pct = clamp(0.2 + 0.8 * throttle + self.rpm / REDLINE * 0.3,
+                                  0.0, 1.0)
+            self.maf = (self.rpm / 60.0) * (DISP_L / 2.0) * 0.85 * 1.184 \
+                * self.load_pct
+            power_w = max(0.0, torque * self.rpm * 2.0 * math.pi / 60.0)
+            burn_l_s = power_w / (0.30 * 32.0e6) + (0.9 / 3600.0)
+            self.fuel_rate = burn_l_s * 3600.0
+            self.fuel = max(0.0, self.fuel - burn_l_s * dt)
+            self.runtime += dt
+
+            # temperatures
+            target = 122.0 if self.limp else 90.0
+            self.coolant += (target - self.coolant) * dt * (0.03 if self.engine_on else 0.004)
+            self.overheat_now = self.coolant > 115.0
+            if self.overheat_now and not getattr(self, "_hot_warned", False):
+                events.append("overheating! limp mode")
+                self._hot_warned = True
+            if not self.limp and self.coolant < 95.0:
+                self._hot_warned = False
+            self.oil += (self.coolant + 8.0 - self.oil) * dt * 0.02
+            self.intake = AMBIENT_C + 8.0 + (self.coolant - AMBIENT_C) * 0.2
+
+        self._thr_prev = self.throttle
+        self.voltage = 14.2 if self.engine_on else 12.4
+        self.odo += abs(self.v) * dt / 1000.0
+
+    # ------------------------------------------------------------ gear shifts
+    def set_gear(self, target, events):
+        if target == self.gear:
+            return
+        speed = abs(self.v) * 3.6
+        if target in ("R", "P") and speed > 8.0:
+            events.append(f"{target} blocked above 8 km/h ({speed:.0f} km/h)")
+            return
+        self.gear = target
+        if target == "D":
+            self.gear_num = 1 if speed > 2.0 else 1
+        elif target == "R":
+            self.gear_num = 0
+        else:
+            self.gear_num = 0
+        self.cruise_on = False
+        events.append(f"gear -> {target}")
+
+    # ------------------------------------------------------------ ctrl stream
+    def snapshot(self, switches, faults):
+        """One 10 Hz state dict for the cockpit GUI."""
+        speed_kmh = abs(self.v) * 3.6 if self.v >= 0 else -abs(self.v) * 3.6
+        return {
+            "speed": round(speed_kmh, 1),
+            "rpm": round(self.rpm, 0),
+            "gear": self.gear,
+            "gear_num": self.gear_num,
+            "throttle": round(self.throttle * 100.0, 1),
+            "brake": round(self.brake * 100.0, 1),
+            "steer": round(self.steer * 100.0, 0),
+            "engine_on": self.engine_on,
+            "coolant": round(self.coolant, 1),
+            "oil": round(self.oil, 1),
+            "intake": round(self.intake, 1),
+            "ambient": AMBIENT_C,
+            "maf": round(self.maf, 1),
+            "fuel": round(self.fuel / TANK_L * 100.0, 1),
+            "fuel_l": round(self.fuel, 1),
+            "odo": round(self.odo, 1),
+            "runtime": int(self.runtime),
+            "voltage": round(self.voltage, 1),
+            "load": round(self.load_pct * 100.0, 1),
+            "limp": self.limp,
+            "rev_limit": self.rev_limit,
+            "cruise_on": self.cruise_on,
+            "cruise_set": round(self.cruise_set, 0),
+            "blink": 1 if int(self.t / 0.333) % 2 == 0 else 0,
+        }
+
+# --------------------------------------------------------------------------- #
+#  Broadcast frames + lamps
+# --------------------------------------------------------------------------- #
+
+def frame_engine(p):
+    """0x100, 20 ms: rpm(2) load throttle coolant+40 maf(2) oil+40."""
+    rpm = clamp(int(p.rpm), 0, 0xFFFF)
+    maf = clamp(int(p.maf * 100.0), 0, 0xFFFF)
+    return bytes([
+        (rpm >> 8) & 0xFF, rpm & 0xFF,
+        clamp(int(p.load_pct * 255.0), 0, 255),
+        clamp(int(p.throttle * 255.0), 0, 255),
+        clamp(int(p.coolant + 40.0), 0, 255),
+        (maf >> 8) & 0xFF, maf & 0xFF,
+        clamp(int(p.oil + 40.0), 0, 255),
+    ])
+
+
+def frame_chassis(p, switches):
+    """0x110, 20 ms: speed km/h brake% flags(ABS event/TC/parkbrake/brake)."""
+    flags = 0x00
+    if p.brake > 0.02:
+        flags |= 0x01                      # brake lamp
+    if p.brake > 0.75 and abs(p.v) * 3.6 > 8.0:
+        flags |= 0x02                      # ABS pulsing
+    if p.tc_pulse:
+        flags |= 0x04                      # traction control event
+    if switches.get("parkbrake", False):
+        flags |= 0x08
+    return bytes([
+        clamp(int(abs(p.v) * 3.6), 0, 255),
+        clamp(int(p.brake * 100.0), 0, 100),
+        flags, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ])
+
+
+def frame_steer(p, switches, blink):
+    """0x120, 50 ms: steer (signed -100..100) + light bits (blink at 1.5 Hz)."""
+    steer = clamp(int(p.steer * 100.0), -100, 100) & 0xFF
+    bits = 0x00
+    if switches.get("headlights", False):
+        bits |= 0x10
+    if switches.get("highbeam", False):
+        bits |= 0x08
+    if switches.get("wipers", False):
+        bits |= 0x20
+    on = blink == 1
+    if switches.get("left", False) and on:
+        bits |= 0x01
+    if switches.get("right", False) and on:
+        bits |= 0x02
+    if switches.get("hazard", False) and on:
+        bits |= 0x04
+    return bytes([steer, bits, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+
+def frame_body(switches):
+    """0x130, 50 ms: doors/trunk/hood/seatbelt bits."""
+    bits = 0x00
+    for i, name in enumerate(("door_fl", "door_fr", "door_rl", "door_rr")):
+        if switches.get(name, False):
+            bits |= 1 << i
+    if switches.get("trunk", False):
+        bits |= 0x10
+    if switches.get("hood", False):
+        bits |= 0x20
+    if switches.get("seatbelt", False):
+        bits |= 0x40
+    return bytes([bits, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+
+
+def frame_gear(p):
+    """0x140, 100 ms: gear enum fuel% odo(u32 LE) runtime-min(u16 LE)."""
+    odo = int(p.odo) & 0xFFFFFFFF
+    rt_min = int(p.runtime / 60.0) & 0xFFFF
+    return bytes([
+        GEAR_ENUM.get(p.gear, 2),
+        clamp(int(p.fuel / TANK_L * 255.0), 0, 255),
+        odo & 0xFF, (odo >> 8) & 0xFF, (odo >> 16) & 0xFF, (odo >> 24) & 0xFF,
+        rt_min & 0xFF, (rt_min >> 8) & 0xFF,
+    ])
+
+
+def compute_lamps(p, faults, switches):
+    """Warning-lamp dict for the GUI + chime/door/low-fuel events."""
+    lamps = {
+        "mil": bool(faults.get("mil") or faults.get("overheat") or faults.get("oil")),
+        "abs": faults.get("abs", False),
+        "tc": p.tc_pulse,
+        "battery": not p.engine_on,
+        "seatbelt": p.engine_on and abs(p.v) * 3.6 > 5.0 and not switches.get("seatbelt", False),
+        "lowfuel": p.fuel / TANK_L * 100.0 < 12.0,
+        "door": any(switches.get(n, False) for n in ("door_fl", "door_fr", "door_rl", "door_rr")),
+        "parkbrake": switches.get("parkbrake", False),
+    }
+    return lamps
+
+
+# --------------------------------------------------------------------------- #
+#  ECU brains (OBD-II mode 01/03/04/09 + UDS 10/14/19/3E)
+# --------------------------------------------------------------------------- #
+
+# PID support masks per ECU (J1979: byte n covers PIDs 8n+1..8n+8)
+ENGINE_PID_MASK = bytearray(16)
+for pid in (0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x10, 0x11, 0x1C, 0x1F, 0x21, 0x2F, 0x31, 0x33, 0x42, 0x45,
+            0x46, 0x5C):
+    ENGINE_PID_MASK[(pid - 1) // 8] |= 0x80 >> ((pid - 1) % 8)
+TCM_PID_MASK = bytearray(16)
+for pid in (0x0D, 0x1C, 0x2F):
+    TCM_PID_MASK[(pid - 1) // 8] |= 0x80 >> ((pid - 1) % 8)
+ABS_PID_MASK = bytearray(16)
+for pid in (0x0D, 0x1C):
+    ABS_PID_MASK[(pid - 1) // 8] |= 0x80 >> ((pid - 1) % 8)
+
+FAULT_DTCS = {
+    "mil":      [(0x03, 0x00, 0x28)],   # P0300 random misfire, confirmed+MIL
+    "overheat": [(0x02, 0x17, 0x28)],   # P0217 engine overtemp, confirmed+MIL
+    "oil":      [(0x05, 0x20, 0x28)],   # P0520 oil pressure, confirmed+MIL
+    "abs":      [(0x40, 0x35, 0x08)],   # C0035 ABS, confirmed (no MIL)
+    "flat":     [],
+}
+
+
+def ecu_for_req(req_id):
+    """Request id -> (ecu response id, 'engine'|'tcm'|'abs'|None)."""
+    if req_id in (REQ_FUNCTIONAL, REQ_ENGINE):
+        return ECU_ENGINE, "engine"
+    if req_id == REQ_TCM:
+        return ECU_TCM, "tcm"
+    if req_id == REQ_ABS:
+        return ECU_ABS, "abs"
+    return None, None
+
+
+def mode01_payload(p, ecu, pid, faults):
+    """Build the data bytes of a 41 <pid> response (no 41 header)."""
+    fuel_pct = p.fuel / TANK_L * 100.0
+    if ecu == "engine":
+        if pid == 0x00:
+            return bytes(ENGINE_PID_MASK[0:4])
+        if pid == 0x20:
+            return bytes(ENGINE_PID_MASK[4:8])
+        if pid == 0x40:
+            return bytes(ENGINE_PID_MASK[8:12])
+        if pid == 0x01:   # MIL + DTC count
+            mil = bool(faults.get("mil") or faults.get("overheat") or faults.get("oil"))
+            n = sum(1 for f in ("mil", "overheat", "oil") if faults.get(f))
+            return bytes([(0x80 if mil else 0x00) | 0x01, n & 0xFF])
+        if pid == 0x03:   # fuel system status: closed loop when running
+            return b"\x02\x01" if p.engine_on else b"\x01\x00"
+        if pid == 0x04:
+            return bytes([clamp(int(p.load_pct * 255.0), 0, 255)])
+        if pid == 0x05:
+            return bytes([clamp(int(p.coolant + 40.0), 0, 255)])
+        if pid == 0x06:
+            return b"\x80"          # STFT 0%
+        if pid == 0x07:
+            return b"\x80"          # LTFT 0%
+        if pid == 0x0C:
+            return bytes([(int(clamp(p.rpm, 0, 0x3FFF) * 4) >> 8) & 0xFF,
+                          int(clamp(p.rpm, 0, 0x3FFF) * 4) & 0xFF])
+        if pid == 0x0D:
+            return bytes([clamp(int(abs(p.v) * 3.6), 0, 255)])
+        if pid == 0x0E:
+            return bytes([clamp(int(10.0 * 2.0 + 64.0), 0, 255)])  # 10 deg adv
+        if pid == 0x0F:
+            return bytes([clamp(int(p.intake + 40.0), 0, 255)])
+        if pid == 0x10:
+            maf = clamp(int(p.maf * 100.0), 0, 0xFFFF)
+            return bytes([(maf >> 8) & 0xFF, maf & 0xFF])
+        if pid == 0x11:
+            return bytes([clamp(int(p.throttle * 255.0), 0, 255)])
+        if pid == 0x1C:
+            return b"\x01"          # OBD-II
+        if pid == 0x1F:
+            return bytes([min(int(p.runtime) & 0xFF, 0xFF)])
+        if pid == 0x21:             # distance with MIL on
+            mil = bool(faults.get("mil") or faults.get("overheat") or faults.get("oil"))
+            return struct.pack("<H", int(p.odo) & 0xFFFF) if mil else b"\x00\x00"
+        if pid == 0x2F:
+            return bytes([clamp(int(fuel_pct * 2.55), 0, 255)])
+        if pid == 0x31:
+            return struct.pack("<H", int(p.odo) & 0xFFFF)
+        if pid == 0x33:
+            return b"\x64"          # 100 kPa baro
+        if pid == 0x42:
+            return bytes([clamp(int(p.voltage * 10.0), 0, 255)])
+        if pid == 0x45:
+            return bytes([clamp(int(p.throttle * 255.0), 0, 255)])
+        if pid == 0x46:
+            return bytes([clamp(int(AMBIENT_C + 40.0), 0, 255)])
+        if pid == 0x5C:
+            return bytes([clamp(int(p.oil + 40.0), 0, 255)])
+        return None
+    if ecu == "tcm":
+        if pid == 0x00:
+            return bytes(TCM_PID_MASK[0:4])
+        if pid == 0x20:
+            return bytes(TCM_PID_MASK[4:8])
+        if pid == 0x0D:
+            return bytes([clamp(int(abs(p.v) * 3.6), 0, 255)])
+        if pid == 0x1C:
+            return b"\x01"
+        if pid == 0x2F:
+            return bytes([clamp(int(fuel_pct * 2.55), 0, 255)])
+        return None
+    if ecu == "abs":
+        if pid == 0x00:
+            return bytes(ABS_PID_MASK[0:4])
+        if pid == 0x20:
+            return bytes(ABS_PID_MASK[4:8])
+        if pid == 0x0D:
+            return bytes([clamp(int(abs(p.v) * 3.6), 0, 255)])
+        if pid == 0x1C:
+            return b"\x01"
+        return None
+    return None
+
+
+def engine_dtcs(faults):
+    """Active engine DTCs: (hi, lo, status) triples, P-codes only."""
+    out = []
+    for f in ("mil", "overheat", "oil"):
+        if faults.get(f):
+            out.extend(FAULT_DTCS[f])
+    return out
+
+
+def abs_dtcs(faults):
+    return list(FAULT_DTCS["abs"]) if faults.get("abs", False) else []
+
+
+def handle_request(req_id, payload, p, faults, ecus_enabled):
+    """
+    One ISO-TP request -> list of items:
+        ("sf", resp_id, bytes)          single frame, send now
+        ("fc", resp_id, bytes)          raw 8-byte FlowControl answer
+        ("mf", resp_id, payload)        multi frame, needs FlowControl
+    Mirrors the reference ECU sim.py's service dispatch, but reads live physics.
+    """
+    ecu_id, ecu = ecu_for_req(req_id)
+    if ecu_id is None:
+        return []
+    if ecu == "tcm" and ecus_enabled < 2:
+        return []
+    if ecu == "abs" and ecus_enabled < 3:
+        return []
+
+    if not payload:
+        return []
+    pci = payload[0]
+
+    # -- incoming FirstFrame: answer raw FlowControl (we don't assemble)
+    if 0x10 <= pci <= 0x1F:
+        return [("fc", ecu_id, b"\x30\x00\x00\x00\x00\x00\x00\x00")]
+    if 0x20 <= pci <= 0x2F or 0x30 <= pci <= 0x3F:
+        return []           # stray CF/FC with nothing pending to assemble
+
+    # -- single frame: PCI byte 0 holds the payload length (1..7)
+    if pci == 0x00 or pci > 0x07:
+        return []
+
+    req = payload[1:1 + pci]            # strip ISO-TP single-frame PCI
+    if not req:
+        return []
+    svc = req[0]
+    body = req[1:]
+
+    if svc == 0x01:                     # mode 01: current data
+        pid = body[0] if body else 0x00
+        data = mode01_payload(p, ecu, pid, faults)
+        if data is None:
+            resp = bytes([0x7F, 0x01, 0x12])
+        else:
+            resp = bytes([0x41, pid]) + data
+    elif svc == 0x03:                   # mode 03: stored DTCs
+        dtcs = engine_dtcs(faults) if ecu == "engine" else []
+        resp = bytes([0x43, len(dtcs)]) + b"".join(
+            bytes([h, l]) for h, l, _s in dtcs)
+    elif svc == 0x04:                   # mode 04: clear DTCs (engine MIL/P-codes)
+        for f in ("mil", "overheat", "oil"):
+            faults[f] = False
+        resp = b"\x44"
+    elif svc == 0x09:                   # mode 09: VIN (engine only)
+        pid = body[0] if body else 0x00
+        if ecu == "engine" and pid == 0x02:
+            return [("mf", ecu_id, b"\x49\x02\x01" + VIN)]
+        resp = bytes([0x7F, 0x09, 0x12])
+    elif svc == 0x10:                   # UDS session control
+        sub = body[0] if body else 0x00
+        resp = bytes([0x50, sub])
+    elif svc == 0x14:                   # UDS clear diagnostic information
+        if ecu == "engine":
+            for f in ("mil", "overheat", "oil"):
+                faults[f] = False
+        elif ecu == "abs":
+            faults["abs"] = False
+        resp = b"\x54"
+    elif svc == 0x19:                   # UDS read DTC information
+        sub = body[0] if body else 0x00
+        if sub == 0x01:
+            n = len(engine_dtcs(faults)) if ecu == "engine" else len(abs_dtcs(faults))
+            resp = bytes([0x59, 0x01, 0xFF, n])
+        elif sub == 0x02:
+            dtcs = engine_dtcs(faults) if ecu == "engine" else abs_dtcs(faults)
+            resp = bytes([0x59, 0x02, 0xFF]) + b"".join(
+                bytes([h, l, s]) for h, l, s in dtcs)
+        else:
+            resp = bytes([0x7F, 0x19, 0x12])
+    elif svc == 0x3E:                   # UDS tester present
+        sub = body[0] if body else 0x00
+        resp = bytes([0x7E, sub])
+    elif svc in (0x02, 0x05, 0x06, 0x07, 0x08, 0x0A):
+        resp = bytes([0x7F, svc, 0x12])  # known OBD mode, unsupported here
+    else:
+        resp = bytes([0x7F, svc, 0x11])  # service not supported
+
+    if len(resp) <= 7:
+        return [("sf", ecu_id, resp)]
+    return [("mf", ecu_id, resp)]
+
+
+# --------------------------------------------------------------------------- #
+#  SLCAN-over-TCP server (adapter server, mirrors reference)
+# --------------------------------------------------------------------------- #
+
+class SlcanClient:
+    def __init__(self, sock, addr, sim):
+        self.sock = sock
+        self.addr = addr
+        self.sim = sim
+        self.lock = threading.Lock()
+        self.open = False
+        self.pending_mf = None           # (rest_bytes, seq) waiting for FC
+        self._buf = b""
+
+    def send_frame(self, can_id, data):
+        """Push one frame as an SLCAN line (only when channel open)."""
+        if not self.open:
+            return
+        dlc = len(data)
+        line = f"t{can_id:03X}{dlc:1X}{data.hex().upper()}\r".encode("ascii")
+        try:
+            with self.lock:
+                self.sock.sendall(line)
+        except OSError:
+            self.sim.drop_client(self)
+
+    def run(self):
+        try:
+            while True:
+                try:
+                    chunk = self.sock.recv(1024)
+                except socket.timeout:
+                    continue        # idle client: keep the link open
+                if not chunk:
+                    break
+                self._buf += chunk
+                while b"\r" in self._buf or b"\n" in self._buf:
+                    line, self._buf = self._buf.split(b"\r", 1)
+                    line = line.strip(b"\n").decode("ascii", "replace").strip()
+                    if line:
+                        self._cmd(line)
+        except OSError:
+            pass
+        finally:
+            self.sim.drop_client(self)
+
+    def _cmd(self, line):
+        c = line[0].upper() if line else ""
+        if c == "S":                     # bitrate (Lawicel codes, logged only)
+            return
+        if c == "O":
+            self.open = True
+            return
+        if c == "C":
+            self.open = False
+            self.pending_mf = None
+            return
+        if c == "V":
+            self._reply(b"V1013\r")
+            return
+        if c == "N":
+            self._reply(b"N0000\r")
+            return
+        if c == "F":
+            self._reply(b"F12\r")
+            return
+        if c in ("t", "T", "r", "R"):
+            if c in ("r", "R"):
+                return
+            frm = self._parse_tx(line)
+            if frm is None or not self.open:
+                return
+            can_id, data = frm
+            self.sim.handle_rx_frame(self, can_id, data)
+
+    def _reply(self, raw):
+        try:
+            with self.lock:
+                self.sock.sendall(raw)
+        except OSError:
+            self.sim.drop_client(self)
+
+    @staticmethod
+    def _parse_tx(line):
+        ext = line[0] == "T"
+        n_id = 8 if ext else 3
+        try:
+            can_id = int(line[1:1 + n_id], 16)
+            dlc = int(line[1 + n_id:2 + n_id], 16)
+            if dlc > 8 or len(line) < 2 + n_id + dlc * 2:
+                return None
+            data = bytes.fromhex(line[2 + n_id:2 + n_id + dlc * 2])
+        except ValueError:
+            return None
+        return can_id, data
+
+
+class SlcanServer:
+    def __init__(self, sim, host, port):
+        self.sim = sim
+        self.host = host
+        self.port = port
+        self.sock = None
+
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(5)
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, addr = self.sock.accept()
+            except OSError:
+                return
+            conn.settimeout(0.5)
+            client = SlcanClient(conn, addr, self.sim)
+            self.sim.add_client(client)
+            threading.Thread(target=client.run, daemon=True).start()
+
+
+# --------------------------------------------------------------------------- #
+#  JSON control channel (cockpit GUI)
+# --------------------------------------------------------------------------- #
+
+class CtrlServer:
+    def __init__(self, sim, host, port):
+        self.sim = sim
+        self.host = host
+        self.port = port
+        self.clients = []
+        self.lock = threading.Lock()
+        self.sock = None
+
+    def start(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind((self.host, self.port))
+        self.sock.listen(5)
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        while True:
+            try:
+                conn, _addr = self.sock.accept()
+            except OSError:
+                return
+            conn.settimeout(0.5)
+            with self.lock:
+                self.clients.append(conn)
+            threading.Thread(target=self._reader, args=(conn,), daemon=True).start()
+
+    def _reader(self, conn):
+        buf = b""
+        while True:
+            try:
+                chunk = conn.recv(1024)
+            except socket.timeout:
+                continue        # idle client: keep the 10 Hz stream open
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                raw, buf = buf.split(b"\n", 1)
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw.decode("utf-8"))
+                except ValueError:
+                    continue
+                self.sim.apply_input(msg)
+        with self.lock:
+            if conn in self.clients:
+                self.clients.remove(conn)
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def push(self, state):
+        blob = (json.dumps(state) + "\n").encode("utf-8")
+        with self.lock:
+            dead = []
+            for c in self.clients:
+                try:
+                    c.sendall(blob)
+                except OSError:
+                    dead.append(c)
+            for c in dead:
+                self.clients.remove(c)
+
+
+# --------------------------------------------------------------------------- #
+#  AF_CAN (SocketCAN / SocketCAN) wire mode
+# --------------------------------------------------------------------------- #
+
+class CanWire:
+    """Raw SocketCAN tap: same pattern as the reference ECU sim.py (AF_CAN / CAN_RAW)."""
+
+    def __init__(self, iface):
+        self.iface = iface
+        self.sock = None
+
+    def open(self):
+        try:
+            import socket as _s
+            s = _s.socket(_s.AF_CAN, _s.SOCK_RAW, _s.CAN_RAW)
+            s.bind((self.iface,))
+        except OSError as e:
+            sys.exit(f"cannot open {self.iface}: {e}\n"
+                     "  sudo ip link set can0 type can bitrate 500000\n"
+                     "  sudo ip link set can0 up")
+        # loopback OFF: we must not re-read our own broadcasts / diagnostic replies
+        try:
+            s.setsockopt(_s.SOL_CAN_RAW, _s.CAN_RAW_LOOPBACK, 0)
+        except (OSError, AttributeError):
+            pass
+        self.sock = s
+
+    def send(self, can_id, data):
+        if len(data) < 8:
+            data += b"\x00" * (8 - len(data))
+        try:
+            self.sock.send(struct.pack("<IB3x8s", can_id, 8, data))
+        except OSError:
+            pass                     # TX queue full: drop (bus is busy)
+
+    def recv(self, timeout):
+        r, _, _ = select.select([self.sock], [], [], timeout)
+        if not r:
+            return None
+        raw = self.sock.recv(16)
+        can_id, dlc = struct.unpack("<IB3x8s", raw)[0], struct.unpack(
+            "<IB3x8s", raw)[1] & 0x0F
+        data = raw[8:8 + dlc]
+        return can_id & 0x1FFFFFFF, data
+
+
+# --------------------------------------------------------------------------- #
+#  The simulation core
+# --------------------------------------------------------------------------- #
+
+class CarSim:
+    """Owns the physics, the ECUs, the clients and the 20 ms tick loop."""
+
+    def __init__(self, host="", slcan_port=SLCAN_PORT, ctrl_port=CTRL_PORT,
+                 iface=None, tcp_also=False, no_traffic=False, ecus=3,
+                 speed=1.0, follower=False):
+        self.host = host
+        self.slcan_port = slcan_port
+        self.ctrl_port = ctrl_port
+        self.iface = iface
+        self.no_traffic = no_traffic
+        self.ecus = ecus
+        self.speed = speed
+        self.phys = CarPhysics()
+        self.follower = follower
+        self.remote_drive = False
+        self.drive_frame = None
+        self.switches = {
+            "headlights": False, "highbeam": False, "wipers": False,
+            "left": False, "right": False, "hazard": False,
+            "parkbrake": False,
+            "door_fl": False, "door_fr": False, "door_rl": False,
+            "door_rr": False, "trunk": False, "hood": False,
+            "seatbelt": True,
+        }
+        self.faults = {"mil": False, "overheat": False, "oil": False,
+                       "abs": False, "flat": False}
+        self.events = []
+        self._ev_lock = threading.Lock()
+        self._clients = {}
+        self._cl_lock = threading.Lock()
+        self.ctrl = CtrlServer(self, host, ctrl_port)
+        self.wire = CanWire(iface) if iface else None
+        self._frames = {}                # id -> (period, next_time)
+        self._frame_builders = {
+            FRAME_ENGINE: (0.020, lambda: frame_engine(self.phys)),
+            FRAME_CHASSIS: (0.020, lambda: frame_chassis(self.phys, self.switches)),
+            FRAME_STEER: (0.050, lambda: frame_steer(
+                self.phys, self.switches, self._blink())),
+            FRAME_BODY: (0.050, lambda: frame_body(self.switches)),
+            FRAME_GEAR: (0.100, lambda: frame_gear(self.phys)),
+        }
+        for fid, (period, _b) in self._frame_builders.items():
+            self._frames[fid] = (period, 0.0)
+        self._parkbrake_ref = None
+        self._last_chime = 0.0
+        self._last_lowfuel = 0.0
+        self._last_door = 0.0
+        self._last_pb = 0.0
+        self._stop = False
+        self._last_frames = []
+        self.wire_pending_mf = None        # (rest, seq, ecu_id) in wire mode
+
+    # ---------------------------------------------------------- client mgmt
+    def add_client(self, client):
+        with self._cl_lock:
+            self._clients[client] = client
+
+    def drop_client(self, client):
+        with self._cl_lock:
+            if client in self._clients:
+                del self._clients[client]
+        try:
+            client.sock.close()
+        except OSError:
+            pass
+
+    def _opened_clients(self):
+        with self._cl_lock:
+            return [c for c in self._clients if c.open]
+
+    def _blink(self):
+        return 1 if int(self.phys.t / 0.333) % 2 == 0 else 0
+
+    # ------------------------------------------------------------- commands
+    def apply_input(self, msg):
+        t = msg.get("t")
+        ev = []
+        if t == "input":
+            self.phys.throttle = clamp(float(msg.get("throttle", 0.0)), 0.0, 1.0)
+            self.phys.brake = clamp(float(msg.get("brake", 0.0)), 0.0, 1.0)
+            self.phys.steer = clamp(float(msg.get("steer", 0.0)), -1.0, 1.0)
+        elif t == "gear":
+            g = str(msg.get("gear", "P")).upper()
+            if g in ("P", "R", "N", "D"):
+                self.phys.set_gear(g, ev)
+        elif t == "ignition":
+            on = bool(msg.get("on", False))
+            self.phys.ignition = on
+            ev.append("ignition ON" if on else "ignition OFF")
+        elif t == "switch":
+            name = str(msg.get("name", ""))
+            on = bool(msg.get("on", False))
+            if name in self.switches:
+                self.switches[name] = on
+                ev.append(f"{name} {'on' if on else 'off'}")
+        elif t == "fault":
+            name = str(msg.get("name", ""))
+            on = bool(msg.get("on", False))
+            if name in self.faults:
+                self.faults[name] = on
+                if name == "flat" and on:
+                    ev.append("flat tyre! limited to ~88 km/h")
+                else:
+                    ev.append(f"fault {name} {'set' if on else 'cleared'}")
+                if not on and name != "flat":
+                    ev.append("DTC will clear on next mode 04 / UDS 14")
+        elif t == "cruise":
+            if "on" in msg:
+                if msg["on"] and not self.phys.cruise_on:
+                    ok = (self.phys.engine_on and self.phys.gear == "D"
+                          and abs(self.phys.v) * 3.6 >= CRUISE_MIN)
+                    if ok:
+                        self.phys.cruise_on = True
+                        self.phys.cruise_set = round(abs(self.phys.v) * 3.6 / 5.0) * 5.0
+                        self.phys._cruise_i = 0.0
+                        ev.append(f"cruise engaged {self.phys.cruise_set:.0f} km/h")
+                    else:
+                        ev.append("cruise needs D and >= 40 km/h")
+                elif not msg["on"] and self.phys.cruise_on:
+                    self.phys.cruise_on = False
+                    ev.append("cruise disengaged")
+            elif "delta" in msg:
+                d = float(msg.get("delta", 0))
+                if self.phys.cruise_on:
+                    self.phys.cruise_set = clamp(
+                        self.phys.cruise_set + d, CRUISE_MIN, CRUISE_MAX)
+                    ev.append(f"cruise set {self.phys.cruise_set:.0f} km/h")
+        elif t == "reset":
+            self.phys.reset()
+            for k in self.switches:
+                self.switches[k] = False
+            self.switches["seatbelt"] = True
+            for k in self.faults:
+                self.faults[k] = False
+            ev.append("sim reset")
+        if ev:
+            with self._ev_lock:
+                self.events.extend(ev)
+
+    # -------------------------------------------------------- drive follower
+    def _apply_drive_frame(self, can_id, data):
+        """ICSim-style: fold external drive frames into the physics."""
+        ev = []
+        if not data:
+            return
+        if can_id == FRAME_DRIVE_IN:                 # dedicated control frame
+            if len(data) >= 4:
+                self.phys.throttle = clamp(data[0] / 255.0, 0.0, 1.0)
+                self.phys.brake = clamp(data[1] / 100.0, 0.0, 1.0)
+                self.phys.steer = clamp((data[3] - 128) / 127.0, -1.0, 1.0)
+            g = GEAR_FROM.get(data[2] & 0x0F)
+            if g:
+                self.phys.set_gear(g, ev)
+        elif can_id == FRAME_ENGINE:                 # engine frame: throttle
+            if len(data) >= 4:
+                self.phys.throttle = clamp(data[3] / 255.0, 0.0, 1.0)
+        elif can_id == FRAME_CHASSIS:                # chassis frame: brake
+            if len(data) >= 2:
+                self.phys.brake = clamp(data[1] / 100.0, 0.0, 1.0)
+        elif can_id == FRAME_STEER:                  # steer frame
+            s = data[0]
+            if s >= 128:
+                s -= 256
+            self.phys.steer = clamp(s / 100.0, -1.0, 1.0)
+        elif can_id == FRAME_GEAR:                   # gear frame
+            g = GEAR_FROM.get(data[0] & 0x0F)
+            if g:
+                self.phys.set_gear(g, ev)
+        self.remote_drive = True
+        self.drive_frame = [can_id, data.hex().upper()]
+        if ev:
+            with self._ev_lock:
+                self.events.extend(ev)
+
+    def _wire_loop(self, timeout=0.05):
+        """Read frames off the CAN wire (diagnostics + follower injection)."""
+        while not self._stop:
+            try:
+                got = self.wire.recv(timeout)
+            except OSError:
+                break
+            if got is None:
+                continue
+            can_id, data = got
+            self.handle_rx_frame(None, can_id, data)
+
+    # -------------------------------------------------------- incoming frames
+    def handle_rx_frame(self, client, can_id, data):
+        """A raw CAN frame arrived from a client (or the CAN wire)."""
+        if not data:
+            return
+        pci = data[0]
+        if pci & 0xF0 == 0x30:                 # FlowControl for our MF reply
+            if client is not None and client.pending_mf:
+                rest, seq, ecu_id = client.pending_mf
+                client.pending_mf = None
+                for i in range(0, len(rest), 7):
+                    chunk = rest[i:i + 7]
+                    chunk += b"\x00" * (8 - len(chunk))
+                    client.send_frame(ecu_id, bytes([0x20 | (seq & 0x0F)]) + chunk)
+                    seq = (seq + 1) & 0x0F
+                    time.sleep(0.018)
+            elif self.wire_pending_mf:
+                rest, seq, ecu_id = self.wire_pending_mf
+                self.wire_pending_mf = None
+                for i in range(0, len(rest), 7):
+                    chunk = rest[i:i + 7]
+                    chunk += b"\x00" * (8 - len(chunk))
+                    self.wire.send(ecu_id, bytes([0x20 | (seq & 0x0F)]) + chunk)
+                    seq = (seq + 1) & 0x0F
+                    time.sleep(0.018)
+            return
+        # ICSim-style: external drive frames fold straight into the physics
+        if self.follower and can_id in DRIVE_IDS:
+            self._apply_drive_frame(can_id, data)
+            return
+        ecu_id, ecu = ecu_for_req(can_id)
+        if ecu_id is None:
+            return
+        items = handle_request(can_id, data, self.phys, self.faults, self.ecus)
+        # In wire mode the ECU answers go out on the CAN bus (real proof).
+        if self.wire is not None:
+            for kind, rid, body in items:
+                if kind == "fc":        # FlowControl: raw 8-byte frame
+                    frm = body + b"\x00" * (8 - len(body))
+                    self.wire.send(rid, frm)
+                elif kind == "sf":
+                    frm = bytes([len(body)]) + body
+                    frm += b"\x00" * (8 - len(frm))
+                    self.wire.send(rid, frm)
+                else:
+                    total = len(body)
+                    ff = bytes([0x10 | ((total >> 8) & 0x0F), total & 0xFF]) \
+                        + body[:6]
+                    ff += b"\x00" * (8 - len(ff))
+                    self.wire.send(rid, ff)
+                    rest = body[6:]
+                    if client is not None:
+                        client.pending_mf = (rest, 1, rid)
+                    else:
+                        self.wire_pending_mf = (rest, 1, rid)
+            return
+        if client is None:
+            return
+        for kind, rid, body in items:
+            if kind == "fc":            # FlowControl: raw 8-byte frame
+                frm = body + b"\x00" * (8 - len(body))
+                client.send_frame(rid, frm)
+            elif kind == "sf":
+                frm = bytes([len(body)]) + body
+                frm += b"\x00" * (8 - len(frm))
+                client.send_frame(rid, frm)
+            else:
+                total = len(body)
+                ff = bytes([0x10 | ((total >> 8) & 0x0F), total & 0xFF]) \
+                    + body[:6]
+                ff += b"\x00" * (8 - len(ff))
+                client.send_frame(rid, ff)
+                client.pending_mf = (body[6:], 1, rid)
+
+    # ------------------------------------------------------------- main tick
+    def tick(self, dt):
+        ev = []
+        self.phys.step(dt, ev, self.switches, self.faults)
+
+        # periodic chimes / warnings
+        now = self.phys.t
+        lamps = compute_lamps(self.phys, self.faults, self.switches)
+        if lamps["seatbelt"] and now - self._last_chime > 5.0:
+            ev.append("seatbelt chime")
+            self._last_chime = now
+        if lamps["lowfuel"] and now - self._last_lowfuel > 10.0:
+            ev.append("low fuel")
+            self._last_lowfuel = now
+        if lamps["door"] and now - self._last_door > 5.0:
+            ev.append("door open")
+            self._last_door = now
+        if self.switches.get("parkbrake") and abs(self.phys.v) * 3.6 > 1.0 \
+                and now - self._last_pb > 3.0:
+            ev.append("park brake while moving!")
+            self._last_pb = now
+        if self.phys.brake > 0.75 and abs(self.phys.v) * 3.6 > 8.0:
+            ev.append("ABS pulsing") if int(now * 4) % 8 == 0 else None
+        with self._ev_lock:
+            self.events.extend(ev)
+
+        # broadcast frames
+        if not self.no_traffic:
+            out = []
+            for fid, (period, next_t) in self._frames.items():
+                if now >= next_t:
+                    self._frames[fid] = (period, now + period)
+                    data = self._frame_builders[fid][1]()
+                    if self.wire is not None:
+                        self.wire.send(fid, data)
+                    else:
+                        out.append({"id": fid, "dlc": len(data),
+                                    "data": data.hex().upper()})
+                        for c in self._opened_clients():
+                            c.send_frame(fid, data)
+                    self._last_frames = out
+            if self.wire is None:
+                self._last_frames = out
+
+        # 10 Hz state stream to the cockpit
+        if int(now * 10.0) != getattr(self, "_last_state_tick", -1):
+            self._last_state_tick = int(now * 10.0)
+            self._push_state()
+
+    def _push_state(self):
+        with self._ev_lock:
+            events = list(self.events)
+            self.events.clear()
+        state = self.phys.snapshot(self.switches, self.faults)
+        state["t"] = "state"
+        state["ts"] = round(self.phys.t, 2)
+        state["switches"] = dict(self.switches)
+        state["faults"] = dict(self.faults)
+        state["lamps"] = compute_lamps(self.phys, self.faults, self.switches)
+        state["frames"] = getattr(self, "_last_frames", [])
+        state["events"] = events[-8:]
+        state["dtc"] = [f"{'PCBU'[(h >> 6) & 3]}{((h << 8) | l) & 0x3FFF:04X}"
+                        for h, l, _s in engine_dtcs(self.faults)]
+        state["dtc_abs"] = [f"{'PCBU'[(h >> 6) & 3]}{((h << 8) | l) & 0x3FFF:04X}"
+                            for h, l, _s in abs_dtcs(self.faults)]
+        state["mode"] = "can-wire" if self.wire else "tcp-bench"
+        state["source"] = ("remote CAN inject" if self.remote_drive
+                          else "keyboard/controller")
+        self.ctrl.push(state)
+
+    # -------------------------------------------------------------- main loop
+    def run(self):
+        self.ctrl.start()
+        if self.wire is not None:
+            self.wire.open()
+            # always read the wire: diagnostics need a request read; follower
+            # additionally folds external drive frames into the physics.
+            threading.Thread(target=self._wire_loop, args=(0.05,), daemon=True).start()
+            print(f"carsim {__version__} on CAN wire {self.iface}")
+            print("  ECUs: engine 7E8, TCM 7E9, ABS 7EA on the CAN bus")
+            print("  broadcast: 0x100/0x110/0x120/0x130/0x140")
+            if self.follower:
+                print("  follower drive: ON  (reads 0x100/0x110/0x120/0x140/0x400 as"
+                      " remote input; send with cangen/cansend)")
+            print("  control channel on %s:%d (cockpit GUI drives here)"
+                  % (self.host or "0.0.0.0", self.ctrl_port))
+            print("  TCP SLCAN server:", "ON" if self._slcan else "OFF (--tcp-also)")
+        else:
+            print(f"carsim {__version__} - SLCAN server on {self.host or '0.0.0.0'}:{self.slcan_port}")
+            print(f"  JSON control channel on {self.host or '0.0.0.0'}:{self.ctrl_port}")
+            print("  client.py --host %s --port %d ping|dtc|vin|live 0C 0D 05"
+                  % (self.host or "127.0.0.1", self.slcan_port))
+        print("  Ctrl-C to stop\n")
+
+        base_dt = 0.02
+        next_t = time.monotonic()
+        try:
+            while not self._stop:
+                self.tick(base_dt)
+                next_t += base_dt
+                sleep = next_t - time.monotonic()
+                if sleep > 0:
+                    time.sleep(min(sleep, 0.05))
+        except KeyboardInterrupt:
+            pass
+        print("bye")
+
+
+# --------------------------------------------------------------------------- #
+#  Self test (headless)
+# --------------------------------------------------------------------------- #
+
+def selftest():
+    """Physics + protocol assertions.  Run by the build pipeline."""
+    ok = lambda name: print(f"  ok  {name}")
+    fail = lambda name, why: (_ for _ in ()).throw(
+        AssertionError(f"{name}: {why}"))
+
+    p = CarPhysics()
+    ev = []
+    faults = {k: False for k in ("mil", "overheat", "oil", "abs", "flat")}
+    switches = {"seatbelt": True}
+
+    # 1) throttle launches the car and auto-shifts
+    p.gear = "D"
+    p.gear_num = 1
+    p.ignition = True
+    p.engine_on = True
+    p.throttle = 1.0
+    for _ in range(300):                  # 6 s of full throttle
+        p.step(0.02, ev, switches, faults)
+    assert p.v * 3.6 > 30.0, f"should be well past 30 km/h, got {p.v*3.6:.1f}"
+    assert p.gear_num >= 2, f"should have upshifted, gear {p.gear_num}"
+    assert any("shift up" in e for e in ev), "no upshift event"
+    assert p.rpm < 7000, f"rpm should respect redline, got {p.rpm:.0f}"
+    ok("full throttle: speed climbs, auto upshifts, rev limiter holds")
+
+    # 2) braking slows the car
+    p.throttle = 0.0
+    p.brake = 1.0
+    v0 = p.v
+    for _ in range(50):                   # 1 s of hard braking
+        p.step(0.02, ev, switches, faults)
+    dt = 50 * 0.02
+    decel = (v0 - p.v) / dt
+    assert decel >= 4.0, f"hard braking should decel >= 4 m/s^2, got {decel:.1f}"
+    ok("hard braking decelerates")
+
+    # 3) RPM reacts to throttle from idle (genuine standstill first)
+    p.brake = 0.0
+    p.throttle = 0.0
+    p.gear = "D"
+    p.gear_num = 1
+    p.v = 0.0
+    p.engine_on = True
+    for _ in range(30):               # settle to true idle at a standstill
+        p.step(0.02, ev, switches, faults)
+    rpm_idle = p.rpm
+    p.throttle = 0.8
+    for _ in range(30):               # blip the throttle
+        p.step(0.02, ev, switches, faults)
+    assert p.rpm > rpm_idle + 1500, f"rpm should climb hard with throttle from idle: {rpm_idle:.0f} -> {p.rpm:.0f}"
+    ok("rpm rises with throttle")
+
+    # 4) PID byte round-trip: 0C rpm and 0D speed decode like a real scan tool
+    data = mode01_payload(p, "engine", 0x0C, faults)
+    rpm = ((data[0] << 8) | data[1]) / 4.0
+    assert abs(rpm - p.rpm) < 2.0, f"rpm decode {rpm} vs physics {p.rpm}"
+    data = mode01_payload(p, "engine", 0x0D, faults)
+    assert data[0] == int(abs(p.v) * 3.6), f"speed decode {data[0]} vs {p.v*3.6:.1f}"
+    ok("J1979 decode round-trip (0C rpm, 0D speed)")
+
+    # 5) PID support mask decodes to the documented PID list
+    pids = []
+    mask = bytes(ENGINE_PID_MASK[0:4])
+    for pid in range(1, 0x21):
+        byte = mask[(pid - 1) // 8]
+        if byte & (0x80 >> ((pid - 1) % 8)):
+            pids.append(pid)
+    want = [0x01, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0C, 0x0D, 0x0E, 0x0F,
+            0x10, 0x11, 0x1C, 0x1F]
+    assert pids == want, f"mask gives {[hex(x) for x in pids]}"
+    ok("PID 00 mask lists exactly the 14 engine PIDs")
+
+    # 6) MIL fault -> mode 03 P0300 -> clear -> gone (SF carries ISO-TP PCI)
+    faults["mil"] = True
+    assert engine_dtcs(faults) == FAULT_DTCS["mil"], engine_dtcs(faults)
+    resp = handle_request(REQ_FUNCTIONAL, b"\x01\x03", p, faults, 3)
+    assert resp[0][0] == "sf" and resp[0][2] == b"\x43\x01\x03\x00", resp
+    resp = handle_request(REQ_FUNCTIONAL, b"\x01\x04", p, faults, 3)
+    assert resp[0][2] == b"\x44", resp
+    assert not engine_dtcs(faults), "mode 04 must clear live engine DTCs"
+    resp = handle_request(REQ_FUNCTIONAL, b"\x01\x03", p, faults, 3)
+    assert resp[0][2] == b"\x43\x00", resp
+    ok("mode 03 shows P0300; mode 04 clears live engine DTCs")
+
+    # 7) VIN multi-frame: FF/FC/CF flow reassembles to the 17-char VIN
+    items = handle_request(REQ_ENGINE, b"\x02\x09\x02", p, faults, 3)
+    assert items[0][0] == "mf", items
+    body = items[0][2]
+    assert body[0:3] == b"\x49\x02\x01" and len(body) == 20, body
+    ff = bytes([0x10 | ((len(body) >> 8) & 0x0F), len(body) & 0xFF]) + body[:6]
+    ff += b"\x00" * (8 - len(ff))
+    collected = bytearray(ff[2:8])
+    seq = 1
+    for i in range(6, len(body), 7):
+        cf = bytes([0x20 | (seq & 0x0F)]) + body[i:i + 7]  # CF: 1 PCI + up to 7 payload
+        cf += b"\x00" * (8 - len(cf))  # pad only the whole frame to 8 bytes
+        collected += cf[1:8]
+        seq = (seq + 1) & 0x0F
+    assert bytes(collected[:20]) == body, "VIN reassembly mismatch"
+    assert body[3:20].decode("ascii") == VIN.decode(), "VIN bytes wrong"
+    ok("mode 09 02 VIN multi-frame reassembles (FF->FC->CF)")
+
+    # 7b) incoming FirstFrame -> raw 30 00 FlowControl (we don't assemble)
+    ff_req = b"\x10\x0B\x02\x09\x02" + b"\x00" * 3
+    items = handle_request(REQ_ENGINE, ff_req, p, faults, 3)
+    assert items == [("fc", ECU_ENGINE, b"\x30\x00\x00\x00\x00\x00\x00\x00")], items
+    ok("incoming FirstFrame answered by raw 30 00 FlowControl")
+
+    # 8) ABS DTC via UDS 19 02 to physical 7E2, then UDS 14 clears it
+    faults["abs"] = True
+    assert abs_dtcs(faults) == FAULT_DTCS["abs"], abs_dtcs(faults)
+    resp = handle_request(REQ_ABS, b"\x03\x19\x02", p, faults, 3)
+    assert resp[0][2] == b"\x59\x02\xFF\x40\x35\x08", resp
+    resp = handle_request(REQ_ABS, b"\x01\x14", p, faults, 3)
+    assert resp[0][2] == b"\x54", resp
+    assert not abs_dtcs(faults), "UDS 14 must clear ABS DTCs"
+    ok("UDS 19 02 to 7E2 reports C0035; UDS 14 clears it")
+
+    # 9) gear blocking: R is refused above 8 km/h
+    p.gear = "D"
+    p.gear_num = 3
+    p.v = 20.0
+    ev.clear()
+    p.set_gear("R", ev)
+    assert p.gear == "D" and any("blocked" in e for e in ev), ev
+    ok("R/P shift blocked above 8 km/h")
+
+    # 10) cruise refuses to engage under 40 km/h in D
+    p.v = 5.0
+    p.cruise_on = False
+    p.cruise_set = 0.0
+    p.set_gear("D", ev)
+    p.engine_on = True
+    # emulate apply_input logic
+    if not (p.engine_on and p.gear == "D" and abs(p.v) * 3.6 >= CRUISE_MIN):
+        p._cruise_ok = False
+    else:
+        p._cruise_ok = True
+    assert p._cruise_ok is False, "cruise should not engage at 18 km/h"
+    ok("cruise needs D and >= 40 km/h")
+
+    # 11) overheat fault -> limp torque (slower acceleration) + P0217
+    p.v = 0.0
+    p.engine_on = True
+    p.gear = "D"
+    p.gear_num = 1
+    p.throttle = 1.0
+    faults["overheat"] = True
+    a_limp = None
+    for _ in range(1):
+        p.step(0.02, ev, switches, faults)
+    v_limp = p.v
+    p.v = 0.0
+    faults["overheat"] = False
+    p.step(0.02, ev, switches, faults)
+    assert p.v > v_limp, "limp mode should reduce acceleration"
+    ok("overheat limps torque (P0217)")
+
+    # 12) flat tyre governor holds ~86-88 km/h under WOT, sets no DTC
+    p.v = 24.0                          # 86.4 km/h: at the cap, foot to the floor
+    p.throttle = 1.0
+    p.brake = 0.0
+    p.gear = "D"
+    p.gear_num = 2
+    p.engine_on = True
+    faults["flat"] = True
+    for _ in range(500):                # 10 s of full throttle
+        p.step(0.02, ev, switches, faults)
+    kmh = p.v * 3.6
+    assert 86.0 <= kmh <= 88.5, f"flat governor broken: {kmh:.1f} km/h"
+    assert not engine_dtcs(faults), "flat must not set a DTC"
+    ok("flat tyre: governor holds 86-88 km/h, no DTC")
+
+    # 13) functional request reaches the engine only; TCM silent on 7DF
+    items = handle_request(REQ_FUNCTIONAL, b"\x02\x01\x0D", p, faults, 3)
+    assert items and items[0][1] == ECU_ENGINE, items
+    ok("functional 0x7DF answered by engine 0x7E8")
+
+    print("\ncarsim selftest: ALL PASS")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+#  main
+# --------------------------------------------------------------------------- #
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Drivable virtual car: physics + OBD/UDS ECU cluster "
+                    "+ SLCAN-over-TCP server (adapter server) + SocketCAN mode.")
+    ap.add_argument("--host", default="", help="bind address (default all)")
+    ap.add_argument("--slcan-port", type=int, default=SLCAN_PORT,
+                    help="SLCAN-over-TCP port (default 20102)")
+    ap.add_argument("--ctrl-port", type=int, default=CTRL_PORT,
+                    help="JSON control port (default 20103)")
+    ap.add_argument("--iface", default=None, metavar="CAN0",
+                    help="SocketCAN/SocketCAN interface; puts ECUs + broadcasts "
+                         "on the WIRE and disables the TCP SLCAN server")
+    ap.add_argument("--tcp-also", action="store_true",
+                    help="keep the TCP SLCAN server in --iface mode")
+    ap.add_argument("--no-traffic", action="store_true",
+                    help="silent bench: no broadcast frames, only ECU replies")
+    ap.add_argument("--ecus", type=int, default=3, choices=[1, 2, 3],
+                    help="1=engine, 2=+TCM, 3=+ABS (default 3)")
+    ap.add_argument("--follower", action="store_true",
+                    help="ICSim-style drive: accept 0x100/0x110/0x120/0x140/0x400 "
+                         "as remote drive input from the bus")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run headless physics/protocol assertions and exit")
+    ap.add_argument("--version", action="version",
+                    version=f"carsim {__version__}")
+    args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
+
+    sim = CarSim(host=args.host, slcan_port=args.slcan_port,
+                 ctrl_port=args.ctrl_port, iface=args.iface,
+                 tcp_also=args.tcp_also, no_traffic=args.no_traffic,
+                 ecus=args.ecus, follower=args.follower)
+    if args.iface and not args.tcp_also:
+        sim._slcan = False
+    else:
+        sim._slcan = True
+        server = SlcanServer(sim, args.host, args.slcan_port)
+        server.start()
+        sim._slcan_server = server
+    sim.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

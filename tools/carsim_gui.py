@@ -1,0 +1,1406 @@
+#!/usr/bin/env python3
+"""
+carsim_gui.py — the cockpit for carsim.py (the "driver" side of the setup).
+
+The simulator (tools/carsim.py) is the ECU cluster + physics engine.  It
+publishes everything over a JSON control channel (default 127.0.0.1:20103):
+
+    TX {"t":"state", ...physics, lamps, faults, switches, frames, events}
+    RX {"t":"input","throttle":0.0,"brake":0.0,"steer":0.0}
+    RX {"t":"gear","gear":"D"}  {"t":"ignition","on":true}
+    RX {"t":"switch","name":"hazard","on":true}   {"t":"fault","name":"mil","on":true}
+    RX {"t":"cruise","on":true}  {"t":"cruise","delta":5}   {"t":"reset"}
+
+The simulator's SLCAN-over-TCP server (default 127.0.0.1:20102) is byte-compatible
+with a Lawicel adapter, so the CAN CONSOLE below sends real "cansend-style"
+frames straight into CarSim.handle_rx_frame() — the same path a SocketCAN/vcan0
+wire uses.  With the sim started --follower, injected 0x100/0x110/0x120/0x140/
+0x400 frames fold into the physics and the game reacts.
+
+Layout (three non-overlapping columns, per the approved mockup):
+  * LEFT  - scrolling road + car sprite (the "game view")
+  * MID   - tiled 3x3 instrument cluster (small non-overlapping gauges) + odo
+  * RIGHT - warning lamps, live-data table, CAN console + quick inject, controls
+  * FOOTER- keyboard + controller-controller hints and the broadcast-ID legend
+
+Input: keyboard AND controller controller (over USB or radio).  Controller support
+is optional — if the SDL SDL runtime is missing it simply falls back to
+keyboard.  The USB/radio note: a game controller (models 1914/1708,
+BLE) exposes a standard Linux controller device the instant it connects, no driver
+needed; older controller One pads need the remote adapter.
+
+Run against a local bench sim:
+    python3 tools/carsim.py --follower &   # ECU side, ctrl :20103 / slcan :20102
+    python3 tools/carsim_gui.py
+
+Run against the network setup (adapter next to the SocketCAN):
+    python3 tools/carsim.py --iface can0 --follower &      # on the car machine
+    python3 tools/carsim_gui.py --host 192.168.4.1         # on the laptop
+
+Headless logic check:  python3 tools/carsim_gui.py --check
+"""
+
+import argparse
+import json
+import math
+import re
+import socket
+import sys
+import threading
+import time
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    _HAS_TK = True
+except Exception:                       # non-GUI env / --check still works
+    tk = None
+    ttk = None
+    _HAS_TK = False
+
+try:                                    # optional controller controller input
+    import SDL
+    _HAS_SDL = True
+    SDL.init()
+except Exception:                       # no SDL runtime -> keyboard only
+    SDL = None
+    _HAS_SDL = False
+
+__version__ = "0.2"
+
+DEFAULT_HOST = "127.0.0.1"
+CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
+SL_PORT = 20102              # SLCAN-over-TCP (matches carsim SLCAN_PORT)
+KMH_TO_MPH = 0.6213712
+
+# --------------------------------------------------------------------------- #
+#  Broadcast frame decode (pure functions -> unit-testable without a display)
+# --------------------------------------------------------------------------- #
+FRAME_NAMES = {
+    0x100: "ENGINE",  0x110: "CHASSIS", 0x120: "STEER",
+    0x130: "BODY",    0x140: "GEAR",    0x400: "DRIVE_IN",
+}
+GEAR_LETTER = {0: "P", 1: "R", 2: "N", 3: "D"}
+
+# External drive-input frame layout (ICSim-style)
+#   [0] throttle 0..255   [1] brake 0..100   [2] gear_enum
+#   [3] steer 0..255 (128=centre)   [4..7] spare
+DRIVE_IN = 0x400
+
+
+def _byte(data, i):
+    return data[i] if i < len(data) else 0
+
+
+def decode_frame(fr):
+    """Turn a raw {"id","data"} broadcast into a human-readable dict."""
+    fid = fr["id"]
+    data = bytes.fromhex(fr.get("data", ""))
+    hexs = fr.get("data", "-")
+    name = FRAME_NAMES.get(fid, hex(fid))
+    fields = {}
+    if fid == 0x100:                                # engine
+        rpm = (_byte(data, 0) << 8) | _byte(data, 1)
+        fields = {
+            "RPM": f"{rpm} rpm",
+            "load": f"{_byte(data, 2) / 2.55:.0f} %",
+            "throttle": f"{_byte(data, 3) / 2.55:.0f} %",
+            "coolant": f"{_byte(data, 4) - 40} C",
+            "MAF": f"{((_byte(data, 5) << 8) | _byte(data, 6)) / 100.0:.2f} g/s",
+            "oil": f"{_byte(data, 7) - 40} C",
+        }
+    elif fid == 0x110:                              # chassis
+        spd = _byte(data, 0)
+        brk = _byte(data, 1)
+        flags = []
+        if _byte(data, 2) & 0x01:
+            flags.append("BRK")
+        if _byte(data, 2) & 0x02:
+            flags.append("ABS")
+        if _byte(data, 2) & 0x04:
+            flags.append("TC")
+        if _byte(data, 2) & 0x08:
+            flags.append("PARK")
+        fields = {
+            "speed": f"{spd} km/h",
+            "brake": f"{brk} %",
+            "flags": ",".join(flags) if flags else "-",
+        }
+    elif fid == 0x120:                              # steer + lamp bits
+        s = _byte(data, 0)
+        if s >= 128:
+            s -= 256
+        b1 = _byte(data, 1)
+        lights = []
+        if b1 & 0x01:
+            lights.append("L")
+        if b1 & 0x02:
+            lights.append("R")
+        if b1 & 0x04:
+            lights.append("HI")
+        if b1 & 0x08:
+            lights.append("HL")
+        if b1 & 0x10:
+            lights.append("WIP")
+        if b1 & 0x20:
+            lights.append("HAZ")
+        fields = {
+            "steer": f"{s}",
+            "lights": ",".join(lights) if lights else "-",
+        }
+    elif fid == 0x130:                              # body
+        b = _byte(data, 0)
+        fields = {"doors": f"{b & 0x0F}", "trunk": "open" if b & 0x10 else "closed",
+                  "hood": "open" if b & 0x20 else "closed",
+                  "belt": "yes" if b & 0x40 else "no"}
+    elif fid == 0x140:                              # gear / fuel / odo
+        odo = (_byte(data, 2) | (_byte(data, 3) << 8)
+               | (_byte(data, 4) << 16) | (_byte(data, 5) << 24))
+        rt = (_byte(data, 6) | (_byte(data, 7) << 8))
+        fields = {
+            "gear": GEAR_LETTER.get(_byte(data, 0), "?"),
+            "fuel": f"{_byte(data, 1) / 2.55:.0f} %",
+            "odo": f"{odo / 1000.0:.1f}k m",
+            "runmin": f"{rt} min",
+        }
+    elif fid == 0x400:                              # inject frame (raw)
+        fields = {
+            "thr": f"{_byte(data, 0) / 255.0:.0%}",
+            "brk": f"{_byte(data, 1)}%",
+            "gear": GEAR_LETTER.get(_byte(data, 2) & 0x0F, "?"),
+            "steer": f"{_byte(data, 3) - 128:+d}",
+        }
+    else:
+        fields = {"data": hexs or "-"}
+    return {"id": fid, "name": name, "dlc": len(data), "hex": hexs, "fields": fields}
+
+
+# --------------------------------------------------------------------------- #
+#  Inject-frame builders (pure -> unit-testable; the "cansend side")
+# --------------------------------------------------------------------------- #
+def build_drive(throttle=0.0, brake=0.0, gear="D", steer=0.0):
+    """ICSim-style control frame 0x400. Returns (can_id, bytes)."""
+    gear_enum = {"P": 0, "R": 1, "N": 2, "D": 3}.get(gear, 3)
+    steer_b = max(0, min(255, int(round(gearshift=128 + steer * 127)))) if False else \
+        max(0, min(255, int(round(128 + steer * 127))))
+    data = bytes([
+        max(0, min(255, int(round(throttle * 255)))),
+        max(0, min(100, int(round(brake * 100)))),
+        gear_enum,
+        steer_b,
+        0, 0, 0, 0,
+    ])
+    return DRIVE_IN, data
+
+
+def build_realistic_0x100(rpm=800, load_pct=0, throttle=0.0, coolant=90,
+                          maf_gps=0.0, oil=100):
+    rpm = max(0, min(8000, int(rpm)))
+    maf = max(0, min(65535, int(maf_gps * 100)))
+    data = bytes([
+        (rpm >> 8) & 0xFF, rpm & 0xFF,
+        max(0, min(255, int(load_pct * 2.55))),
+        max(0, min(255, int(throttle * 255))),
+        max(40, min(215, int(coolant + 40))),
+        (maf >> 8) & 0xFF, maf & 0xFF,
+        max(40, min(215, int(oil + 40))),
+    ])
+    return 0x100, data
+
+
+def build_realistic_0x110(speed_kmh=0, brake_pct=0, flags=0):
+    data = bytes([max(0, min(255, int(speed_kmh))),
+                  max(0, min(100, int(brake_pct))),
+                  flags & 0xFF, 0, 0, 0, 0, 0])
+    return 0x110, data
+
+
+def build_realistic_0x120(steer=0.0, lamps=0):
+    s = max(-128, min(127, int(round(steer * 100)))) & 0xFF
+    data = bytes([s, lamps & 0xFF, 0, 0, 0, 0, 0, 0])
+    return 0x120, data
+
+
+def build_realistic_0x140(gear="D", fuel_pct=50, odo_km=0, runtime_min=0):
+    gear_enum = {"P": 0, "R": 1, "N": 2, "D": 3}.get(gear, 3)
+    odo = int(odo_km * 1000)
+    data = bytes([
+        gear_enum, max(0, min(255, int(fuel_pct * 2.55))),
+        odo & 0xFF, (odo >> 8) & 0xFF, (odo >> 16) & 0xFF, (odo >> 24) & 0xFF,
+        runtime_min & 0xFF, (runtime_min >> 8) & 0xFF,
+    ])
+    return 0x140, data
+
+
+# --------------------------------------------------------------------------- #
+#  Slcan "cansend" console client
+# --------------------------------------------------------------------------- #
+SLCAN_RE = re.compile(r"(?:cansend\s+\S+\s+)?(0x[0-9A-Fa-f]+|[0-9A-Fa-f]{3,8})\s*[#\s]\s*([0-9A-Fa-f]{2,16})$")
+
+
+def parse_cansend(text):
+    """Parse 'cansend vcan0 400#FF00038000000000' -> (can_id, bytes) or None."""
+    t = text.strip().rstrip(";")
+    m = SLCAN_RE.match(t)
+    if not m:
+        return None
+    try:
+        can_id = int(m.group(1), 16)
+        data = bytes.fromhex(m.group(2))
+    except ValueError:
+        return None
+    if len(data) > 8 or can_id > 0x1FFFFFFF:
+        return None
+    return can_id, data
+
+
+class CanInjector:
+    """Thin SLCAN-over-TCP client: opens the adapter server and sends 't' frames.
+    This is exactly what cansend does against a SocketCAN/Lawicel adapter."""
+
+    def __init__(self, host, port, on_log=None):
+        self.host = host
+        self.port = port
+        self.on_log = on_log
+        self.status = "offline"
+        self.sock = None
+        self._lock = threading.Lock()
+        self._run = True
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def stop(self):
+        self._run = False
+        s = self.sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _loop(self):
+        while self._run:
+            try:
+                s = socket.create_connection((self.host, self.port), timeout=3)
+            except OSError:
+                self.status = "offline"
+                time.sleep(2.0)
+                continue
+            try:
+                s.settimeout(1.0)
+                with self._lock:
+                    self.sock = s
+                self.status = "online"
+                s.sendall(b"O\r")                    # open the adapter channel
+                if self.on_log:
+                    self.on_log(f"CAN injector online {self.host}:{self.port}")
+            except OSError:
+                self.status = "offline"
+                with self._lock:
+                    self.sock = None
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            while self._run:
+                try:
+                    s.recv(1024)                      # drain (we ignore rx here)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+            with self._lock:
+                if self.sock is s:
+                    self.sock = None
+            self.status = "offline"
+
+    def send_frame(self, can_id, data):
+        if len(data) > 8:
+            return False
+        line = f"t{can_id:03X}{len(data):X}{data.hex().upper()}\r"
+        with self._lock:
+            s = self.sock
+        if s is None:
+            self.status = "offline"
+            return False
+        try:
+            s.sendall(line.encode("ascii"))
+            return True
+        except OSError:
+            return False
+
+    def send_cansend(self, text):
+        parsed = parse_cansend(text)
+        if parsed is None:
+            return False, "bad frame (want 400#FF00038000000000)"
+        can_id, data = parsed
+        if self.send_frame(can_id, data):
+            return True, f"t{can_id:03X}{len(data)}{data.hex().upper()}"
+        return False, "injector offline"
+
+
+# --------------------------------------------------------------------------- #
+#  Gauge geometry (pure helpers; tkinter-arc convention kept consistent)
+# --------------------------------------------------------------------------- #
+def _pt(cx, cy, r, deg):
+    a = math.radians(deg)
+    return cx + r * math.cos(a), cy - r * math.sin(a)
+
+
+def gauge_angle(value, vmax, start=135.0, sweep=270.0):
+    v = max(0.0, min(value, vmax))
+    return start + (v / vmax) * sweep if vmax else start
+
+
+def arc_points(cx, cy, r, a0, a1, n=48):
+    pts = []
+    for i in range(n + 1):
+        a = a0 + (a1 - a0) * i / n
+        pts += list(_pt(cx, cy, r, a))
+    return pts
+
+
+# --------------------------------------------------------------------------- #
+#  JSON control client (thread-safe, importable without a display)
+# --------------------------------------------------------------------------- #
+class CockpitClient:
+    """Connects to carsim's JSON control channel; stores the latest state."""
+
+    def __init__(self, host, port, on_state=None, on_log=None):
+        self.host = host
+        self.port = port
+        self.on_state = on_state
+        self.on_log = on_log
+        self.state = {}
+        self.status = "offline"
+        self.sock = None
+        self._lock = threading.Lock()
+        self._run = True
+        self._t = threading.Thread(target=self._loop, daemon=True)
+        self._t.start()
+
+    def stop(self):
+        self._run = False
+        s = self.sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _set_status(self, s):
+        self.status = s
+
+    def _loop(self):
+        while self._run:
+            try:
+                s = socket.create_connection((self.host, self.port), timeout=3)
+            except OSError:
+                self._set_status("offline")
+                if self.on_log:
+                    self.on_log(f"connect {self.host}:{self.port} failed - retrying")
+                time.sleep(2.0)
+                continue
+            try:
+                s.settimeout(0.5)
+                self.sock = s
+                self._set_status("online")
+                if self.on_log:
+                    self.on_log(f"connected to sim {self.host}:{self.port}")
+            except OSError:
+                s.close()
+                self._set_status("offline")
+                continue
+            buf = b""
+            while self._run:
+                try:
+                    chunk = s.recv(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    raw, buf = buf.split(b"\n", 1)
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        msg = json.loads(raw.decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    if isinstance(msg, dict) and msg.get("t") == "state":
+                        self.state = msg
+                        if self.on_state:
+                            self.on_state(msg)
+            with self._lock:
+                if self.sock is s:
+                    self.sock = None
+            try:
+                s.close()
+            except OSError:
+                pass
+            self._set_status("offline")
+            if self._run and self.on_log:
+                self.on_log("disconnected - retrying")
+
+    def send(self, msg):
+        with self._lock:
+            s = self.sock
+        if s is None:
+            return False
+        try:
+            s.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+            return True
+        except OSError:
+            return False
+
+    @property
+    def online(self):
+        return self.status == "online"
+
+
+# --------------------------------------------------------------------------- #
+#  controller controller input (USB / radio) - optional SDL
+# --------------------------------------------------------------------------- #
+def map_pad(axes, buttons, hat, prev):
+    """Pure mapping: controller axes/buttons -> cockpit drive commands.
+
+    game controller (USB or BT) on Linux via SDL exposes:
+      axes:  0=LX, 1=LY, 2=LT, 3=RT, 4=RX, 5=RY   (triggers -1..1, idle -1)
+      buttons: 0=A 1=B 2=X 3=Y 4=LB 5=RB 6=Back 7=Start 8=Guide 9=LS 10=RS
+    Returns {throttle, brake, steer, events:[...]} where events are edge actions
+    fired only on a rising button edge (prev is the previous buttons tuple).
+    """
+    def ax(i, default=0.0):
+        return axes[i] if i < len(axes) else default
+
+    def btn(i):
+        return buttons[i] if i < len(buttons) else 0
+
+    steer = ax(0)                                    # left stick X
+    # throttle/brake: prefer right stick Y (down=+1 -> brake, up=-1 -> gas)
+    ry = ax(5)
+    throttle = max(0.0, -ry) if len(axes) >= 6 else 0.0
+    brake = max(0.0, ry) if len(axes) >= 6 else 0.0
+    # triggers (if present) override: positive pull -> 0..1
+    lt = max(0.0, ax(2) + 1.0) if len(axes) > 2 else 0.0    # idle -1 -> 0
+    rt = max(0.0, ax(3) + 1.0) if len(axes) > 3 else 0.0
+    if rt > 0.02 or lt > 0.02:
+        brake = max(brake, lt)
+        throttle = max(throttle, rt)
+
+    events = []
+    def pressed(i, action):
+        if btn(i) and not prev[i]:
+            events.append(action)
+
+    pressed(0, ("gear", "D"))        # A -> D
+    pressed(1, ("gear", "N"))        # B -> N
+    pressed(2, "parkbrake")          # X -> parkbrake toggle
+    pressed(3, "reset")              # Y -> reset
+    pressed(4, ("gear", "P"))        # LB -> P
+    pressed(5, ("gear", "D"))        # RB -> D
+    pressed(6, "hazard")             # Back -> hazard toggle
+    pressed(7, "ignition")           # Start -> ignition toggle
+
+    return {"throttle": throttle, "brake": brake, "steer": steer,
+            "events": events}
+
+
+# --------------------------------------------------------------------------- #
+#  Road + gauge drawing helpers (only used when Tk is present)
+# --------------------------------------------------------------------------- #
+def _arc(cv, cx, cy, r, a0, a1, width=3, color="#888", n=48):
+    cv.create_line(*arc_points(cx, cy, r, a0, a1, n), fill=color,
+                   width=width, capstyle="round", smooth=True)
+
+
+def _draw_gauge(cv, cx, cy, r, value, vmax, label, color,
+                start=135.0, sweep=270.0, major=4, units=""):
+    cv.create_oval(cx - r - 5, cy - r - 5, cx + r + 5, cy + r + 5,
+                   outline="#0a0a0a", fill="#101010")
+    _arc(cv, cx, cy, r, start, start + sweep, width=3, color="#3a3a3a")
+    for i in range(major + 1):
+        v = vmax * i / major
+        a = gauge_angle(v, vmax, start, sweep)
+        x1, y1 = _pt(cx, cy, r - 3, a)
+        x2, y2 = _pt(cx, cy, r - 11, a)
+        cv.create_line(x1, y1, x2, y2, fill="#bbb", width=2)
+        lx, ly = _pt(cx, cy, r - 20, a)
+        cv.create_text(lx, ly, text=str(int(v)), fill="#999",
+                       font=("Helvetica", 7, "bold"))
+    _arc(cv, cx, cy, r, start + sweep * 0.85, start + sweep,
+         width=3, color="#c0392b")
+    a = gauge_angle(value, vmax, start, sweep)
+    nx, ny = _pt(cx, cy, r - 13, a)
+    cv.create_line(cx, cy, nx, ny, fill=color, width=3)
+    cv.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=color, outline="#000")
+    cv.create_text(cx, cy + r * 0.52, text=label, fill="#888",
+                   font=("Helvetica", 8, "bold"))
+    val_txt = f"{value:.0f}" if vmax >= 100 else f"{value:.1f}"
+    cv.create_text(cx, cy + r * 0.34, text=val_txt, fill="#e8e8e8",
+                   font=("Helvetica", 13, "bold"))
+    if units:
+        cv.create_text(cx, cy + r * 0.74, text=units, fill="#777",
+                       font=("Helvetica", 7))
+
+
+# --------------------------------------------------------------------------- #
+#  The cockpit window
+# --------------------------------------------------------------------------- #
+class Cockpit:
+    def __init__(self, root, host, ctrl_port, slcan_port):
+        if not _HAS_TK:
+            raise RuntimeError("tkinter not available")
+        self.root = root
+        self.host = host
+        self.port = ctrl_port
+        self.sl_port = slcan_port
+        self.units = "kmh"
+        self.autopilot = False
+        self.ap_target = 100.0
+        self._state = {}
+        self._scroll = 0.0
+        self._steer_ofs = 0.0
+        self._prev_frames = {}
+        self.frame_history = []
+        self._ap_t0 = 0.0
+        self._ap_phase = 0
+        self._last_live = None
+        self._pad_prev = (0,) * 16
+        self._pad_available = False
+
+        self.client = CockpitClient(host, ctrl_port, on_state=self._on_state,
+                                    on_log=self._log)
+        self.injector = CanInjector(host, slcan_port, on_log=self._log)
+        self._init_controller()
+
+        self.root.title("CAN FIRECOCKPIT - carsim setup")
+        self.root.configure(bg="#0b0d10")
+        self._build_ui()
+        self._bind_keys()
+        self._last_render = 0.0
+        self._ap_last = 0.0
+        self._tick()
+
+    # ------------------------------------------------------------ controller
+    def _init_controller(self):
+        if not _HAS_SDL:
+            self._log("controller: SDL unavailable - keyboard only")
+            return
+        SDL.event.pump()
+        if SDL.controller.get_count() == 0:
+            self._log("controller: no controller found (controller via USB or BT). "
+                      "Keyboard active until one connects.")
+            return
+        self._pad = SDL.controller.controller(0)
+        self._pad.init()
+        self._pad_available = True
+        self._log(f"controller: {self._pad.get_name()} online (USB or radio)")
+
+    def _poll_controller(self):
+        if not self._pad_available or not _HAS_SDL:
+            return
+        SDL.event.pump()
+        try:
+            axes = [self._pad.get_axis(i) for i in range(self._pad.get_numaxes())]
+            nbtn = self._pad.get_numbuttons()
+            buttons = tuple(self._pad.get_button(i) for i in range(nbtn))
+            hat = (0, 0)
+            if self._pad.get_numhats() > 0:
+                hat = tuple(self._pad.get_hat(0))
+        except SDL.error:
+            self._pad_available = False
+            self._log("controller: disconnected - keyboard only")
+            return
+        cmd = map_pad(axes, buttons, hat, self._pad_prev)
+        self._pad_prev = buttons
+        self.thr_var.set(cmd["throttle"] * 100.0)
+        self.brk_var.set(cmd["brake"] * 100.0)
+        self.steer_var.set(cmd["steer"] * 100.0)
+        self.client.send({"t": "input", "throttle": cmd["throttle"],
+                          "brake": cmd["brake"], "steer": cmd["steer"]})
+        for ev in cmd["events"]:
+            if isinstance(ev, tuple):
+                self.client.send({"t": "gear", "gear": ev[1]})
+            elif ev == "parkbrake":
+                self._switch("parkbrake")
+            elif ev == "hazard":
+                self._switch("hazard")
+            elif ev == "ignition":
+                self._ign(not self._state.get("engine_on", False))
+            elif ev == "reset":
+                self.client.send({"t": "reset"})
+            self._log(f"controller: {ev}")
+
+    # ------------------------------------------------------------ state hook
+    def _on_state(self, msg):
+        self._state = msg
+        self._sync_frames(msg.get("frames", []))
+
+    def _sync_frames(self, frames):
+        for fr in frames:
+            key = (fr.get("id"), fr.get("data"))
+            if self._prev_frames.get(fr.get("id")) != fr.get("data"):
+                self._prev_frames[fr.get("id")] = fr.get("data")
+                self.frame_history.append(
+                    {"ts": time.strftime("%H:%M:%S"), **fr})
+        self.frame_history = self.frame_history[-36:]
+
+    def _log(self, text):
+        if getattr(self, "log_box", None) is not None:
+            self.log_box.insert("end", text + "\n")
+            self.log_box.see("end")
+
+    # ============================================================== UI build
+    def _build_ui(self):
+        # top status bar
+        top = ttk.Frame(self.root)
+        top.pack(fill="x", padx=8, pady=(6, 2))
+        self.status_lbl = ttk.Label(top, text="status: connecting...",
+                                    foreground="#ccc")
+        self.status_lbl.pack(side="left")
+        ttk.Label(top, text="  mode:").pack(side="left")
+        self.mode_lbl = ttk.Label(top, text="-", foreground="#3f9")
+        self.mode_lbl.pack(side="left", padx=(0, 10))
+        ttk.Label(top, text="time:").pack(side="left")
+        self.ts_lbl = ttk.Label(top, text="0.0 s", foreground="#3f9")
+        self.ts_lbl.pack(side="left", padx=(0, 10))
+        ttk.Label(top, text="odo:").pack(side="left")
+        self.odo_lbl = ttk.Label(top, text="0.0 km", foreground="#3f9")
+        self.odo_lbl.pack(side="left", padx=(0, 12))
+        self.source_lbl = ttk.Label(top, text="drive: keyboard/controller",
+                                    foreground="#fb0")
+        self.source_lbl.pack(side="left", padx=(0, 12))
+        self.units_var = tk.StringVar(value="km/h")
+        ttk.Radiobutton(top, text="km/h", variable=self.units_var, value="km/h",
+                        command=self._toggle_units).pack(side="right")
+        ttk.Radiobutton(top, text="mph", variable=self.units_var, value="mph",
+                        command=self._toggle_units).pack(side="right")
+
+        body = ttk.Frame(self.root)
+        body.pack(fill="both", expand=True, padx=8, pady=2)
+
+        # ---- LEFT: road / game view
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both")
+        self.road_cv = tk.Canvas(left, width=560, height=430, bg="#0d1208",
+                                 highlightthickness=0)
+        self.road_cv.pack(side="top", fill="both", expand=True)
+
+        # ---- MIDDLE: tiled instrument cluster
+        mid = ttk.Frame(body, width=430)
+        mid.pack(side="left", fill="both", padx=(8, 0))
+        mid.pack_propagate(False)
+        self.cluster_cv = tk.Canvas(mid, width=430, height=430, bg="#101010",
+                                    highlightthickness=0)
+        self.cluster_cv.pack(fill="both", expand=True)
+
+        # ---- RIGHT: lamps + live data + CAN console + controls
+        right = ttk.Frame(body, width=470)
+        right.pack(side="left", fill="both", padx=(8, 0))
+        right.pack_propagate(False)
+        self._build_right(right)
+
+        # ---- FOOTER: help + legend
+        self._build_footer()
+
+    def _build_right(self, parent):
+        nb = ttk.Notebook(parent)
+        nb.pack(fill="both", expand=True)
+
+        # ---------------- COCKPIT tab (lamps/live/console per mockup)
+        cockpit = ttk.Frame(nb)
+        nb.add(cockpit, text="Cockpit")
+        self.lamps_cv = tk.Canvas(cockpit, height=70, bg="#0e0e0e",
+                                  highlightthickness=0)
+        self.lamps_cv.pack(fill="x", padx=4, pady=(4, 0))
+
+        self.live_txt = tk.Text(cockpit, height=14, bg="#0e0e0e", fg="#cfd8e0",
+                                font=("Consolas", 9), padx=6, pady=4,
+                                relief="flat")
+        self.live_txt.pack(fill="x", padx=4, pady=(4, 0))
+
+        # CAN console
+        cframe = ttk.LabelFrame(cockpit, text="CAN INJECT (cansend / console)")
+        cframe.pack(fill="x", padx=4, pady=(6, 2))
+        self.inject_var = tk.StringVar(value="cansend vcan0 400#FF00038000000000")
+        row = ttk.Frame(cframe)
+        row.pack(fill="x", padx=4, pady=2)
+        ttk.Entry(row, textvariable=self.inject_var).pack(side="left",
+                                                          fill="x", expand=True)
+        ttk.Button(row, text="SEND", command=self._send_inject).pack(side="left",
+                                                                     padx=(4, 0))
+        q = ttk.Frame(cframe)
+        q.pack(fill="x", padx=4, pady=(0, 4))
+        qbtn = [("THROTTLE +", self._q_throttle_plus),
+                ("BRAKE +", self._q_brake_plus),
+                ("GEAR D", self._q_gear_d),
+                ("REVERSE", self._q_reverse),
+                ("STEER +", self._q_steer_plus),
+                ("STEER -", self._q_steer_minus),
+                ("CANCEL", self._q_cancel)]
+        for i, (t, c) in enumerate(qbtn):
+            ttk.Button(q, text=t, command=c).grid(
+                row=i // 4, column=i % 4, padx=2, pady=2, sticky="ew")
+
+        # ---------------- SERVICE tab (ignition/gear/switch/fault/cruise/AP)
+        service = ttk.Frame(nb)
+        nb.add(service, text="Service")
+
+        ttk.Label(service, text="Ignition").grid(row=0, column=0, sticky="w")
+        self.ign_btn = ttk.Button(service, text="START",
+                                  command=lambda: self._ign(True))
+        self.ign_btn.grid(row=0, column=1, padx=2)
+        ttk.Button(service, text="OFF", command=lambda: self._ign(False)).grid(
+            row=0, column=2)
+
+        ttk.Label(service, text="Gear").grid(row=1, column=0, sticky="w")
+        for i, g in enumerate("PRND"):
+            ttk.Button(service, text=g, command=lambda g=g: self.client.send(
+                {"t": "gear", "gear": g})).grid(row=1, column=1 + i)
+
+        ttk.Label(service, text="Throttle").grid(row=2, column=0, sticky="w")
+        self.thr_var = tk.DoubleVar(value=0.0)
+        ttk.Scale(service, from_=0, to=100, variable=self.thr_var,
+                  command=lambda v: self.client.send(
+                      {"t": "input", "throttle": float(v) / 100.0,
+                       "brake": self.brk_var.get() / 100.0,
+                       "steer": self.steer_var.get() / 100.0})).grid(
+            row=2, column=1, columnspan=3, sticky="ew")
+
+        ttk.Label(service, text="Brake").grid(row=3, column=0, sticky="w")
+        self.brk_var = tk.DoubleVar(value=0.0)
+        ttk.Scale(service, from_=0, to=100, variable=self.brk_var,
+                  command=lambda v: self.client.send(
+                      {"t": "input", "throttle": self.thr_var.get() / 100.0,
+                       "brake": float(v) / 100.0,
+                       "steer": self.steer_var.get() / 100.0})).grid(
+            row=3, column=1, columnspan=3, sticky="ew")
+
+        ttk.Label(service, text="Steer").grid(row=4, column=0, sticky="w")
+        self.steer_var = tk.DoubleVar(value=0.0)
+        ttk.Scale(service, from_=-100, to=100, variable=self.steer_var,
+                  command=lambda v: self.client.send(
+                      {"t": "input", "throttle": self.thr_var.get() / 100.0,
+                       "brake": self.brk_var.get() / 100.0,
+                       "steer": float(v) / 100.0})).grid(
+            row=4, column=1, columnspan=3, sticky="ew")
+
+        ttk.Button(service, text="CRUISE",
+                   command=self._cruise_toggle).grid(row=5, column=1)
+        self.cruise_lbl = ttk.Label(service, text="off", foreground="#888")
+        self.cruise_lbl.grid(row=5, column=2)
+        self.ap_btn = ttk.Button(service, text="AUTOPILOT OFF",
+                                 command=self._ap_toggle)
+        self.ap_btn.grid(row=5, column=3)
+        ttk.Button(service, text="RESET", command=lambda: self.client.send(
+            {"t": "reset"})).grid(row=6, column=1)
+        self.dtc_lbl = ttk.Label(service, text="no active DTCs", foreground="#888",
+                                 wraplength=220, justify="left")
+        self.dtc_lbl.grid(row=7, column=0, columnspan=4, sticky="w")
+
+        # switches
+        swf = ttk.LabelFrame(service, text="Switches")
+        swf.grid(row=8, column=0, columnspan=4, sticky="ew", pady=6)
+        self.sw_checks = {}
+        for i, name in enumerate(("headlights", "wipers", "hazard", "parkbrake")):
+            v = tk.BooleanVar(value=False)
+            cb = ttk.Checkbutton(swf, text=name, variable=v,
+                                 command=lambda n=name, v=v: self._switch3(n, v))
+            cb.grid(row=i // 2, column=i % 2, sticky="w", padx=4, pady=2)
+            self.sw_checks[name] = v
+
+        # fault bank
+        ftf = ttk.LabelFrame(service, text="Faults")
+        ftf.grid(row=9, column=0, columnspan=4, sticky="ew", pady=6)
+        self.fl_checks = {}
+        for i, name in enumerate(("mil", "overheat", "flat", "abs")):
+            v = tk.BooleanVar(value=False)
+            cb = ttk.Checkbutton(ftf, text=name, variable=v,
+                                 command=lambda n=name, v=v: self._fault3(n, v))
+            cb.grid(row=i // 2, column=i % 2, sticky="w", padx=4, pady=2)
+            self.fl_checks[name] = v
+        ttk.Button(ftf, text="clear all", command=self._clear_faults).grid(
+            row=2, column=0, columnspan=2)
+
+        # log
+        self.log_box = tk.Text(service, height=9, bg="#0e0e0e", fg="#9ff",
+                               font=("Consolas", 8), relief="flat")
+        self.log_box.grid(row=10, column=0, columnspan=4, sticky="ew",
+                          pady=(6, 0))
+
+    def _build_footer(self):
+        f = ttk.LabelFrame(self.root, text="inputs & bus")
+        f.pack(fill="x", padx=8, pady=(0, 6))
+        kb = ("KEYBOARD   W/↑ gas   S/↓ brake   A/D steer   P R N D gear   "
+              "I ignition   SPACE parkbrake   H hazards   R reset")
+        xb = ("controller   LS steer   RS gas/brake   LT/RT gas·brake   A D   B N   "
+              "X parkbrake   Y reset   LB/RB P·D   BACK hazards   START ignition   "
+              "C autopilot")
+        ttk.Label(f, text=kb, foreground="#8fa").pack(anchor="w")
+        gp = "controller: n/a (keyboard only)" if not _HAS_SDL else \
+             ("controller: ONLINE" if self._pad_available else "controller: none connected")
+        ttk.Label(f, text=xb + "   [" + gp + "]", foreground="#8fa").pack(
+            anchor="w")
+        ttk.Label(f, text="Bus broadcast / drive IDs       0x100 ENG   0x110 CHAS   "
+                          "0x120 STEER+lights   0x130 BODY   0x140 GEAR/fuel/odo   "
+                          "0x400 DRIVE_IN (thr·brk·gear·steer)   diag 0x7DF->0x7E8",
+                  foreground="#79c").pack(anchor="w")
+
+    # ------------------------------------------------------------- controls
+    def _send_inject(self):
+        ok, msg = self.injector.send_cansend(self.inject_var.get())
+        self._log(("SENT " if ok else "FAIL ") + msg)
+
+    def _q_inject(self, fid, data):
+        if self.injector.send_frame(fid, data):
+            self._log(f"inj {fid:03X}#{data.hex().upper()}")
+        else:
+            self._log("inj FAIL: injector offline")
+
+    def _q_throttle_plus(self):
+        cur = self._state.get("throttle", 0.0)
+        fid, d = build_drive(throttle=min(1.0, cur + 0.2),
+                             brake=self._state.get("brake", 0.0),
+                             gear=self._state.get("gear", "D"),
+                             steer=self._state.get("steer", 0.0) / 100.0)
+        self._q_inject(fid, d)
+
+    def _q_brake_plus(self):
+        cur = self._state.get("brake", 0.0)
+        fid, d = build_drive(throttle=self._state.get("throttle", 0.0),
+                             brake=min(1.0, cur + 0.2),
+                             gear=self._state.get("gear", "D"),
+                             steer=self._state.get("steer", 0.0) / 100.0)
+        self._q_inject(fid, d)
+
+    def _q_gear_d(self):
+        self._q_inject(*build_drive(gear="D"))
+
+    def _q_reverse(self):
+        self._q_inject(*build_drive(gear="R"))
+
+    def _q_steer_plus(self):
+        cur = self._state.get("steer", 0.0) / 100.0
+        self._q_inject(*build_drive(steer=min(1.0, cur + 0.15)))
+
+    def _q_steer_minus(self):
+        cur = self._state.get("steer", 0.0) / 100.0
+        self._q_inject(*build_drive(steer=max(-1.0, cur - 0.15)))
+
+    def _q_cancel(self):
+        self._q_inject(*build_drive(throttle=0.0, brake=0.0, gear="D", steer=0.0))
+
+    def _bind_keys(self):
+        self.root.bind("<KeyPress-Up>", lambda e: self._key_thr(1.0))
+        self.root.bind("<KeyRelease-Up>", lambda e: self._key_thr(0.0))
+        self.root.bind("<KeyPress-w>", lambda e: self._key_thr(1.0))
+        self.root.bind("<KeyRelease-w>", lambda e: self._key_thr(0.0))
+        self.root.bind("<KeyPress-Down>", lambda e: self._key_brk(1.0))
+        self.root.bind("<KeyRelease-Down>", lambda e: self._key_brk(0.0))
+        self.root.bind("<KeyPress-s>", lambda e: self._key_brk(1.0))
+        self.root.bind("<KeyRelease-s>", lambda e: self._key_brk(0.0))
+        self.root.bind("<KeyPress-Left>", lambda e: self._key_steer(-1.0))
+        self.root.bind("<KeyRelease-Left>", lambda e: self._key_steer(0.0))
+        self.root.bind("<KeyPress-Right>", lambda e: self._key_steer(1.0))
+        self.root.bind("<KeyRelease-Right>", lambda e: self._key_steer(0.0))
+        self.root.bind("<KeyPress-i>", lambda e: self._ign(True))
+        self.root.bind("<KeyPress-I>", lambda e: self._ign(False))
+        for g in "prndPRND":
+            self.root.bind(f"<KeyPress-{g}>",
+                           lambda e, g=g: self.client.send(
+                               {"t": "gear", "gear": g.upper()}))
+        self.root.bind("<KeyPress-c>", lambda e: self._cruise_toggle())
+        self.root.bind("<KeyPress-C>", lambda e: self._cruise_toggle())
+        self.root.bind("<KeyPress-plus>", lambda e: self._cruise_delta(5))
+        self.root.bind("<KeyPress-equal>", lambda e: self._cruise_delta(5))
+        self.root.bind("<KeyPress-minus>", lambda e: self._cruise_delta(-5))
+        self.root.bind("<KeyPress-a>", lambda e: self._ap_toggle())
+        self.root.bind("<KeyPress-A>", lambda e: self._ap_toggle())
+        self.root.bind("<KeyPress-u>", lambda e: self._toggle_units())
+        self.root.bind("<KeyPress-space>", lambda e: self._switch("parkbrake"))
+        self.root.bind("<KeyPress-h>", lambda e: self._switch("hazard"))
+        self.root.bind("<KeyPress-r>", lambda e: self.client.send({"t": "reset"}))
+        self.root.bind("<KeyPress-F1>", lambda e: self._log(
+            "keys: W/S gas/brake, A/D steer, PRND gear, i ignition, "
+            "space parkbrake, h hazard, c cruise, +/- set, a autopilot, "
+            "u units, r reset"))
+
+    def _ign(self, on):
+        self.client.send({"t": "ignition", "on": on})
+        self.ign_btn.configure(text="START" if not on else "RUNNING")
+
+    def _cruise_toggle(self):
+        self.client.send({"t": "cruise", "on": not self._state.get(
+            "cruise_on", False)})
+
+    def _cruise_delta(self, d):
+        self.client.send({"t": "cruise", "delta": d})
+
+    def _ap_toggle(self):
+        self.autopilot = not self.autopilot
+        self.ap_btn.configure(text="AUTOPILOT ON" if self.autopilot else "OFF")
+        if self.autopilot:
+            self._ap_t0 = time.monotonic()
+            st = self._state
+            if st.get("engine_on") and st.get("gear") == "D":
+                self._ap_phase = 3
+                self._log("autopilot ON - already driving")
+            elif st.get("engine_on"):
+                self._ap_phase = 2
+                self._log("autopilot ON - engaging D")
+            else:
+                self._ap_phase = 1
+                self._log("autopilot ON - engine start sequence")
+        else:
+            self._ap_phase = 0
+            self.client.send({"t": "input", "throttle": 0.0, "brake": 0.0,
+                              "steer": 0.0})
+            self._log("autopilot OFF")
+
+    def _switch(self, name):
+        cur = self.sw_checks.get(name)
+        if cur is not None:
+            cur.set(not cur.get())
+            self.client.send({"t": "switch", "name": name, "on": cur.get()})
+
+    def _switch3(self, name, var):
+        self.client.send({"t": "switch", "name": name, "on": var.get()})
+
+    def _fault3(self, name, var):
+        self.client.send({"t": "fault", "name": name, "on": var.get()})
+
+    def _clear_faults(self):
+        for name, v in self.fl_checks.items():
+            v.set(False)
+            self.client.send({"t": "fault", "name": name, "on": False})
+        self._log("all faults cleared")
+
+    def _toggle_units(self):
+        self.units = "mph" if self.units_var.get() == "mph" else "kmh"
+
+    def _key_thr(self, v):
+        self.thr_var.set(v * 100.0)
+        self.client.send({"t": "input", "throttle": v,
+                          "brake": self.brk_var.get() / 100.0,
+                          "steer": self.steer_var.get() / 100.0})
+
+    def _key_brk(self, v):
+        self.brk_var.set(v * 100.0)
+        self.client.send({"t": "input", "throttle": self.thr_var.get() / 100.0,
+                          "brake": v, "steer": self.steer_var.get() / 100.0})
+
+    def _key_steer(self, v):
+        self.steer_var.set(v * 100.0)
+        self.client.send({"t": "input", "throttle": self.thr_var.get() / 100.0,
+                          "brake": self.brk_var.get() / 100.0, "steer": v})
+
+    # ------------------------------------------------------------ autopilot
+    def _autopilot(self):
+        st = self._state
+        gear = st.get("gear", "P")
+        engine = st.get("engine_on", False)
+        speed = abs(st.get("speed", 0.0))
+        if self._ap_phase == 1:
+            if gear in ("P", "N"):
+                self.client.send({"t": "ignition", "on": True})
+                self._ap_phase = 2
+                self._log("cranking in %s..." % gear)
+            else:
+                if speed > 1.0:
+                    self._log("autopilot: shifting P (waiting for stop)")
+                self.client.send({"t": "gear", "gear": "P"})
+                self.client.send({"t": "input", "throttle": 0.0,
+                                  "brake": 0.3, "steer": 0.0})
+            return
+        if self._ap_phase == 2:
+            if gear not in ("P", "N"):
+                self.client.send({"t": "gear", "gear": "P"})
+            if not engine:
+                self.client.send({"t": "ignition", "on": True})
+                return
+            self.client.send({"t": "gear", "gear": "D"})
+            self._ap_phase = 3
+            self._log("engine started - engaging D")
+            return
+        if not engine:
+            self._ap_phase = 1
+            self._log("engine stalled - restarting")
+            return
+        target = self.ap_target
+        err = target - speed
+        thr = 0.0 if err < 0 else min(0.85, 0.03 + err * 0.012)
+        brk = min(1.0, max(0.0, (speed - target) * 0.06)) if speed > target + 2 else 0.0
+        t = time.monotonic() - self._ap_t0
+        steer = 0.14 * math.sin(t * 0.7)
+        self.thr_var.set(thr * 100.0)
+        self.brk_var.set(brk * 100.0)
+        self.steer_var.set(steer * 100.0)
+        self.client.send({"t": "input", "throttle": thr, "brake": brk,
+                          "steer": steer})
+
+    # --------------------------------------------------------------- helpers
+    def _spd(self, kmh):
+        return kmh * 0.6213712 if self.units == "mph" else kmh
+
+    def _spdu(self):
+        return "mph" if self.units == "mph" else "km/h"
+
+    # --------------------------------------------------------------- render
+    def _tick(self):
+        now = time.monotonic()
+        self._poll_controller()
+        self._render()
+        if self.autopilot and (now - self._ap_last) > 0.1:
+            self._ap_last = now
+            self._autopilot()
+        self.root.after(100, self._tick)
+
+    def _render(self):
+        st = self._state
+        self.status_lbl.configure(
+            text=f"status: {self.client.status}  ctrl:{self.host}:{self.port}"
+                 f"  bus:{self.injector.status} {self.host}:{self.sl_port}")
+        self.mode_lbl.configure(text=st.get("mode", "-"))
+        self.ts_lbl.configure(text=f"{st.get('ts', 0.0):.1f} s")
+        self.odo_lbl.configure(text=f"{st.get('odo', 0.0):.1f} km")
+        self.source_lbl.configure(
+            text="drive: " + st.get("source", "keyboard/controller"))
+        self.cruise_lbl.configure(text=("on" if st.get("cruise_on") else "off"))
+        self.dtc_lbl.configure(text=self._dtc_text(st))
+        self._render_road(st)
+        self._render_cluster(st)
+        self._render_lamps(st)
+        self._render_live(st)
+
+    def _dtc_text(self, st):
+        parts = []
+        dtc = st.get("dtc") or []
+        dtc_abs = st.get("dtc_abs") or []
+        if dtc:
+            parts.append("ENG: " + " ".join(dtc))
+        if dtc_abs:
+            parts.append("ABS: " + " ".join(dtc_abs))
+        if st.get("faults", {}).get("flat"):
+            parts.append("flat tyre limiter")
+        return "\n".join(parts) if parts else "no active DTCs"
+
+    # ------------------------------------------------------------ road scene
+    def _render_road(self, st):
+        cv = self.road_cv
+        cv.delete("all")
+        w = int(cv["width"])
+        h = int(cv["height"])
+        speed_kmh = abs(st.get("speed", 0.0))
+        self._scroll += speed_kmh / 3.6 * 0.1
+        steer = st.get("steer", 0.0) / 100.0
+        self._steer_ofs += (-steer * 80 - self._steer_ofs) * 0.12
+        road_center = w / 2.0 + self._steer_ofs
+        road_w = 300.0
+        cv.create_rectangle(road_center - road_w / 2, 0, road_center + road_w / 2,
+                            h, fill="#1a1a1a", outline="")
+        cv.create_line(road_center - road_w / 2, 0, road_center - road_w / 2, h,
+                       fill="#555", width=3)
+        cv.create_line(road_center + road_w / 2, 0, road_center + road_w / 2, h,
+                       fill="#555", width=3)
+        spacing = 60
+        for k in range(-2, (h // spacing) + 3):
+            yy = (k * spacing + self._scroll) % h
+            cv.create_line(road_center, yy - spacing / 2, road_center,
+                           yy + spacing / 2, fill="#e8c93a", width=4)
+        cx = road_center
+        cy = h * 0.78
+        car_w, car_h = 74, 128
+        sw = st.get("switches", {})
+        if sw.get("headlights"):
+            cv.create_polygon(cx - car_w * 0.42, cy - car_h * 0.5,
+                              cx - car_w * 0.42, cy - car_h * 0.5 - 90,
+                              cx + car_w * 0.42, cy - car_h * 0.5 - 90,
+                              cx + car_w * 0.42, cy - car_h * 0.5,
+                              fill="#fff3b0", stipple="gray50", outline="")
+        cv.create_rectangle(cx - car_w / 2, cy - car_h / 2, cx + car_w / 2,
+                            cy + car_h / 2, fill="#2d3f66", outline="#0a0a0a",
+                            width=2)
+        cv.create_rectangle(cx - car_w / 2 + 6, cy - car_h * 0.30,
+                            cx + car_w / 2 - 6, cy - car_h * 0.05,
+                            fill="#1b2a45", outline="#111")
+        cv.create_rectangle(cx - car_w / 2 + 4, cy - car_h * 0.05,
+                            cx + car_w / 2 - 4, cy + car_h * 0.28,
+                            fill="#26385c", outline="#111")
+        wl, ww = car_w + 8, 14
+        for wy in (cy - car_h * 0.30, cy + car_h * 0.18):
+            cv.create_rectangle(cx - wl / 2, wy, cx - wl / 2 + ww, wy + 20,
+                                fill="#0a0a0a")
+            cv.create_rectangle(cx + wl / 2 - ww, wy, cx + wl / 2, wy + 20,
+                                fill="#0a0a0a")
+        if st.get("brake", 0.0) > 0.05 or sw.get("parkbrake"):
+            cv.create_rectangle(cx - car_w / 2 - 4, cy - car_h * 0.02,
+                                cx - car_w / 2 + 6, cy + car_h * 0.10,
+                                fill="#ff3b30", outline="")
+            cv.create_rectangle(cx + car_w / 2 - 6, cy - car_h * 0.02,
+                                cx + car_w / 2 + 4, cy + car_h * 0.10,
+                                fill="#ff3b30", outline="")
+        if sw.get("hazard") or sw.get("left") or sw.get("right"):
+            blink = int(self._state.get("ts", 0.0) * 2.0) % 2 == 0
+            if blink and (sw.get("hazard") or sw.get("left")):
+                cv.create_rectangle(cx - car_w / 2 - 4, cy - car_h * 0.28,
+                                    cx - car_w / 2 + 4, cy - car_h * 0.16,
+                                    fill="#ff9f0a", outline="")
+            if blink and (sw.get("hazard") or sw.get("right")):
+                cv.create_rectangle(cx + car_w / 2 - 4, cy - car_h * 0.28,
+                                    cx + car_w / 2 + 4, cy - car_h * 0.16,
+                                    fill="#ff9f0a", outline="")
+        if sw.get("wipers"):
+            cv.create_line(cx, cy - car_h * 0.30, cx - car_w * 0.5,
+                           cy - car_h * 0.14, fill="#ccf", width=2)
+        gear = st.get("gear", "P")
+        cv.create_text(cx, cy - car_h * 0.34, text=gear, fill="#e8c93a",
+                       font=("Helvetica", 26, "bold"))
+        cv.create_text(10, 16, anchor="w",
+                       text=f"{self._spd(speed_kmh):.0f} {self._spdu()}",
+                       fill="#e8e8e8", font=("Helvetica", 16, "bold"))
+
+    # ------------------------------------------------------------ cluster
+    def _render_cluster(self, st):
+        cv = self.cluster_cv
+        cv.delete("all")
+        w, h = int(cv["width"]), int(cv["height"])
+        cv.create_rectangle(0, 0, w, h, fill="#101010", outline="")
+        spd = abs(st.get("speed", 0.0))
+        spd_disp = self._spd(spd)
+        spd_max = 240.0 if self.units == "kmh" else 150.0
+        rpm = st.get("rpm", 0.0)
+        coolant = st.get("coolant", 40.0)
+        fuel = st.get("fuel", 0.0)
+        load = st.get("load", 0.0)
+        voltage = st.get("voltage", 12.4)
+        odo = st.get("odo", 0.0)
+        trip = st.get("trip", 0.0)
+        maf = st.get("maf", 0.0)
+        runmin = st.get("runtime", 0.0) / 60.0
+        # 3x3 tiled gauges, evenly spaced, NO overlap
+        ncol, nrow = 3, 3
+        gx0, gy0 = w / (ncol * 2), h / (nrow * 2)
+        gx_step, gy_step = w / ncol, h / nrow
+        rad = min(gx_step, gy_step) * 0.34
+        cfg = [
+            ("RPM", rpm, 6400, "#ff6b3d", "rpm"),
+            ("SPEED", spd_disp, spd_max, "#34d1ce", self._spdu()),
+            ("COOL", max(0, coolant - 40), 120, "#ff9f0a", "C"),
+            ("VOLT", voltage, 16.0, "#7bd17b", "V"),
+            ("FUEL", fuel, 100.0, "#7bd17b", "%"),
+            ("LOAD", load, 100.0, "#ffd60a", "%"),
+            ("OIL", st.get("oil", 40.0) - 40, 160, "#ffd60a", "C"),
+            ("MAF", maf, 30.0, "#34d1ce", "g/s"),
+            ("TRIP", trip, 900.0, "#e0a0ff", "km"),
+        ]
+        for idx, (label, val, vmax, col, unit) in enumerate(cfg):
+            row, col_i = divmod(idx, ncol)
+            cx = gx0 + col_i * gx_step
+            cy = gy0 + row * gy_step
+            _draw_gauge(cv, cx, cy, rad, val, vmax, label, col, units=unit)
+        # odo row
+        y = h - 34
+        cv.create_text(12, y, anchor="w",
+                       text=f"ODO {odo:06.0f} km   {self._spdu()}: "
+                            f"{self._spd(spd):.0f}   trip {trip:.1f} km   "
+                            f"run {runmin:.0f} min",
+                       fill="#e8e8e8", font=("Helvetica", 11, "bold"))
+
+    def _render_lamps(self, st):
+        cv = self.lamps_cv
+        cv.delete("all")
+        w = int(cv["width"])
+        lamps = st.get("lamps", {})
+        sw = st.get("switches", {})
+        flag = []
+        def add(name, col):
+            flag.append((name, col))
+        if lamps.get("mil"):
+            add(("MIL"), "#ff5a3c")
+        if lamps.get("abs"):
+            add(("ABS"), "#ff9f0a")
+        if lamps.get("tc"):
+            add(("TC"), "#ffd60a")
+        if lamps.get("battery"):
+            add(("BATT"), "#ff3b30")
+        if lamps.get("seatbelt"):
+            add(("BELT"), "#ff3b30")
+        if lamps.get("lowfuel"):
+            add(("FUEL"), "#ffd60a")
+        if lamps.get("door"):
+            add(("DOOR"), "#ff9f0a")
+        if lamps.get("parkbrake"):
+            add(("P!"), "#ff3b30")
+        if sw.get("highbeam"):
+            add(("HI"), "#7db8ff")
+        if sw.get("hazard"):
+            add(("HZ"), "#ff9f0a")
+        if st.get("rev_limit"):
+            add(("REV"), "#ff3b30")
+        if st.get("limp"):
+            add(("LIMP"), "#ff9f0a")
+        if not flag:
+            cv.create_text(w / 2, 24, text="ALL OK", fill="#3f9",
+                           font=("Helvetica", 11, "bold"))
+            return
+        n = len(flag)
+        step = min(72, (w - 20) / max(1, n))
+        x = 20
+        for name, col in flag:
+            cv.create_oval(x - 13, 10, x + 13, 36, outline=col, width=2)
+            cv.create_text(x, 23, text=name, fill=col, font=("Helvetica", 7, "bold"))
+            x += step
+
+    def _render_live(self, st):
+        s = st.get("source", "")
+        lines = [
+            f"source            : {s}",
+            f"Engine RPM        : {st.get('rpm', 0):.0f}",
+            f"Speed             : {self._spd(abs(st.get('speed', 0))):.1f} {self._spdu()}",
+            f"Coolant           : {st.get('coolant', 0):.0f} C",
+            f"Intake air        : {st.get('intake', 0):.0f} C",
+            f"Throttle pos      : {st.get('throttle', 0):.0f} %",
+            f"Brake             : {st.get('brake', 0):.0f} %",
+            f"Fuel level        : {st.get('fuel', 0):.0f} %",
+            f"Engine load       : {st.get('load', 0):.0f} %",
+            f"MAF               : {st.get('maf', 0):.1f} g/s",
+            f"Voltage           : {st.get('voltage', 0):.1f} V",
+            f"Oil temp          : {st.get('oil', 0):.0f} C",
+            f"Gear              : {st.get('gear', 'P')}  {st.get('gear_num', 0)}",
+            f"Odometer          : {st.get('odo', 0):.1f} km",
+        ]
+        blob = "\n".join(lines)
+        if blob != self._last_live:
+            self._last_live = blob
+            self.live_txt.delete("1.0", "end")
+            self.live_txt.insert("1.0", blob)
+
+
+# --------------------------------------------------------------------------- #
+#  Entry points
+# --------------------------------------------------------------------------- #
+def _headless_check():
+    """No-display sanity check of decode/inject/mapping helpers."""
+    checks = []
+
+    def enc(fid, data):
+        return {"id": fid, "dlc": len(data), "data": data.hex().upper()}
+
+    # ---- zero-length / malformed guard
+    d = bytes([0x04, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])   # 0x100 rpm 0x040E = 1038
+    dec = decode_frame(enc(0x100, d))
+    checks.append(("0x100 rpm=1038", dec["fields"]["RPM"] == "1038 rpm"))
+
+    # ---- 0x400 decode round-trip
+    fid, data = build_drive(throttle=1.0, brake=0.5, gear="D", steer=1.0)
+    checks.append(("build_drive id", fid == 0x400))
+    checks.append(("build_drive thr", data[0] == 255))
+    checks.append(("build_drive brk", data[1] == 50))
+    checks.append(("build_drive gear", data[2] == 3))
+    checks.append(("build_drive steer", data[3] == 255))
+    dec = decode_frame(enc(fid, data))
+    checks.append(("0x400 decode thr", dec["fields"]["thr"] == "100%"))
+    checks.append(("0x400 decode brk", dec["fields"]["brk"] == "50%"))
+    checks.append(("0x400 decode gear", dec["fields"]["gear"] == "D"))
+
+    # ---- realistic frames
+    fid, d = build_realistic_0x100(rpm=4200, throttle=0.2, coolant=90, oil=100,
+                                   maf_gps=12.34)
+    checks.append(("0x100 builder id", fid == 0x100))
+    checks.append(("0x100 builder rpm", (d[0] << 8 | d[1]) == 4200))
+    checks.append(("0x100 builder throttle", d[3] == 51))
+    checks.append(("0x100 builder coolant", d[4] == 130))
+    fid, d = build_realistic_0x110(speed_kmh=72, brake_pct=55, flags=0x03)
+    checks.append(("0x110 builder", d[0] == 72 and d[1] == 55 and d[2] == 0x03))
+    fid, d = build_realistic_0x120(steer=-0.3, lamps=0x19)
+    checks.append(("0x120 builder", d[0] == 0xE2 and d[1] == 0x19))
+    fid, d = build_realistic_0x140(gear="D", fuel_pct=50, odo_km=123.456,
+                                   runtime_min=5)
+    odo = d[2] | d[3] << 8 | d[4] << 16 | d[5] << 24
+    checks.append(("0x140 builder odo", odo == 123456))
+
+    # ---- cansend parser (exactly what can-utils types)
+    p = parse_cansend("cansend vcan0 400#FF00038000000000")
+    checks.append(("parse cansend id", p is not None and p[0] == 0x400))
+    checks.append(("parse cansend data", p is not None and p[1].hex() ==
+                   "ff00038000000000"))
+    p2 = parse_cansend("cansend vcan0 100#28024463C0000900")
+    checks.append(("parse 0x100 cansend", p2 is not None and p2[0] == 0x100))
+    checks.append(("parse rejects junk", parse_cansend("hello world") is None))
+    checks.append(("parse rejects >8", parse_cansend("400#112233445566778899") is None))
+
+    # ---- controller mapping (pure, no controller needed)
+    axes = [0.0, 0.0, -1.0, -1.0, 0.0, 0.0]                # idle: triggers -1
+    btns = (0,) * 16
+    cmd = map_pad(axes, btns, (0, 0), btns)
+    checks.append(("map_pad idle", abs(cmd["throttle"]) < 1e-6 and
+                   abs(cmd["brake"]) < 1e-6))
+    # full right stick up -> throttle; down -> brake
+    axes = [1.0, 0.0, -1.0, -1.0, 0.0, -1.0]               # LX right, RY up
+    cmd = map_pad(axes, btns, (0, 0), btns)
+    checks.append(("map_pad steer right", cmd["steer"] > 0.9))
+    checks.append(("map_pad RY throttle", cmd["throttle"] > 0.9))
+    axes = [0.0, 0.0, 1.0, 1.0, 0.0, 0.0]                  # triggers pulled (on 2/3)
+    cmd = map_pad(axes, btns, (0, 0), btns)
+    checks.append(("map_pad trigger throttle", cmd["throttle"] > 0.9))
+    checks.append(("map_pad trigger brake", cmd["brake"] > 0.9))
+    # rising button edge -> gear event
+    prev = (0,) * 16
+    cur = list(prev)
+    cur[0] = 1                                              # A pressed
+    cmd = map_pad([0.0] * 6, tuple(cur), (0, 0), prev)
+    checks.append(("map_pad A->D", ("gear", "D") in cmd["events"]))
+    # held button: no repeat (edge only)
+    cmd2 = map_pad([0.0] * 6, tuple(cur), (0, 0), tuple(cur))
+    checks.append(("map_pad edge no-repeat", cmd2["events"] == []))
+
+    # ---- gauge geometry
+    checks.append(("gauge_angle min", abs(gauge_angle(0, 240) - 135.0) < 1e-6))
+    checks.append(("gauge_angle max", abs(gauge_angle(240, 240) - 405.0) < 1e-6))
+    pts = arc_points(100, 100, 80, 135, 405, 48)
+    checks.append(("arc_points", len(pts) == 2 * (48 + 1)))
+
+    fail = 0
+    for name, ok in checks:
+        print(("  ok " if ok else "  FAIL ") + name)
+        if not ok:
+            fail += 1
+    if fail:
+        print(f"carsim_gui headless check: {fail} FAILED")
+        return 1
+    print("carsim_gui headless check: ALL PASS")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Cockpit GUI for carsim.py")
+    ap.add_argument("--host", default=DEFAULT_HOST,
+                    help=f"carsim host (default {DEFAULT_HOST})")
+    ap.add_argument("--port", type=int, default=CTRL_PORT,
+                    help=f"JSON control port (default {CTRL_PORT})")
+    ap.add_argument("--slcan-port", type=int, default=SL_PORT,
+                    help=f"SLCAN injector port (default {SL_PORT})")
+    ap.add_argument("--check", action="store_true",
+                    help="run headless decode/inject/controller checks and exit")
+    args = ap.parse_args()
+
+    if args.check:
+        sys.exit(_headless_check())
+
+    if not _HAS_TK:
+        print("tkinter not available in this environment", file=sys.stderr)
+        return 1
+
+    root = tk.Tk()
+    Cockpit(root, args.host, args.port, args.slcan_port)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
