@@ -66,7 +66,7 @@ except Exception:                       # no SDL runtime -> keyboard only
     SDL = None
     _HAS_SDL = False
 
-__version__ = "0.2"
+__version__ = "0.3"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -538,14 +538,15 @@ def _draw_gauge(cv, cx, cy, r, value, vmax, label, color,
     nx, ny = _pt(cx, cy, r - 13, a)
     cv.create_line(cx, cy, nx, ny, fill=color, width=3)
     cv.create_oval(cx - 3, cy - 3, cx + 3, cy + 3, fill=color, outline="#000")
-    cv.create_text(cx, cy + r * 0.52, text=label, fill="#888",
-                   font=("Helvetica", 8, "bold"))
+    # value + units inside the dial; caption BELOW the dial face
     val_txt = f"{value:.0f}" if vmax >= 100 else f"{value:.1f}"
-    cv.create_text(cx, cy + r * 0.34, text=val_txt, fill="#e8e8e8",
-                   font=("Helvetica", 13, "bold"))
+    cv.create_text(cx, cy - 2, text=val_txt, fill="#e8e8e8",
+                   font=("Helvetica", 12, "bold"))
     if units:
-        cv.create_text(cx, cy + r * 0.74, text=units, fill="#777",
+        cv.create_text(cx, cy + 12, text=units, fill="#8b98a5",
                        font=("Helvetica", 7))
+    cv.create_text(cx, cy + r + 14, text=label, fill="#9fd2ff",
+                   font=("Helvetica", 8, "bold"))
 
 
 # --------------------------------------------------------------------------- #
@@ -564,7 +565,7 @@ class Cockpit:
         self.ap_target = 100.0
         self._state = {}
         self._scroll = 0.0
-        self._steer_ofs = 0.0
+        self._car_lat = 0.0          # lateral car position (road stays fixed)
         self._prev_frames = {}
         self.frame_history = []
         self._ap_t0 = 0.0
@@ -642,13 +643,14 @@ class Cockpit:
         self._sync_frames(msg.get("frames", []))
 
     def _sync_frames(self, frames):
+        # log EVERY received frame so the CAN BUS monitor shows the live
+        # stream (each id updates at its own broadcast period)
         for fr in frames:
-            key = (fr.get("id"), fr.get("data"))
-            if self._prev_frames.get(fr.get("id")) != fr.get("data"):
-                self._prev_frames[fr.get("id")] = fr.get("data")
-                self.frame_history.append(
-                    {"ts": time.strftime("%H:%M:%S"), **fr})
-        self.frame_history = self.frame_history[-36:]
+            self.frame_history.append(
+                {"ts": time.strftime("%H:%M:%S"),
+                 "id": fr.get("id"), "dlc": fr.get("dlc", 8),
+                 "data": fr.get("data", "")})
+        self.frame_history = self.frame_history[-120:]
 
     def _log(self, text):
         if getattr(self, "log_box", None) is not None:
@@ -658,28 +660,36 @@ class Cockpit:
     # ============================================================== UI build
     def _build_ui(self):
         # top status bar
-        top = ttk.Frame(self.root)
+        # plain tk widgets with hard-coded colours: native ttk themes ignore
+        # Style settings and painted labels green-on-light (unreadable)
+        top = tk.Frame(self.root, bg="#0b0d10")
         top.pack(fill="x", padx=8, pady=(6, 2))
-        self.status_lbl = ttk.Label(top, text="status: connecting...",
-                                    foreground="#ccc")
+        self.status_lbl = tk.Label(top, text="status: connecting...",
+                                   bg="#0b0d10", fg="#d7e2ea")
         self.status_lbl.pack(side="left")
-        ttk.Label(top, text="  mode:").pack(side="left")
-        self.mode_lbl = ttk.Label(top, text="-", foreground="#3f9")
+        tk.Label(top, text="  mode:", bg="#0b0d10", fg="#8b98a5").pack(side="left")
+        self.mode_lbl = tk.Label(top, text="-", bg="#0b0d10", fg="#e8e8e8")
         self.mode_lbl.pack(side="left", padx=(0, 10))
-        ttk.Label(top, text="time:").pack(side="left")
-        self.ts_lbl = ttk.Label(top, text="0.0 s", foreground="#3f9")
+        tk.Label(top, text="time:", bg="#0b0d10", fg="#8b98a5").pack(side="left")
+        self.ts_lbl = tk.Label(top, text="0.0 s", bg="#0b0d10", fg="#e8e8e8")
         self.ts_lbl.pack(side="left", padx=(0, 10))
-        ttk.Label(top, text="odo:").pack(side="left")
-        self.odo_lbl = ttk.Label(top, text="0.0 km", foreground="#3f9")
+        tk.Label(top, text="odo:", bg="#0b0d10", fg="#8b98a5").pack(side="left")
+        self.odo_lbl = tk.Label(top, text="0.0 km", bg="#0b0d10", fg="#e8e8e8")
         self.odo_lbl.pack(side="left", padx=(0, 12))
-        self.source_lbl = ttk.Label(top, text="drive: keyboard/controller",
-                                    foreground="#fb0")
+        self.source_lbl = tk.Label(top, text="drive: keyboard/controller",
+                                  bg="#0b0d10", fg="#ffd60a")
         self.source_lbl.pack(side="left", padx=(0, 12))
         self.units_var = tk.StringVar(value="km/h")
-        ttk.Radiobutton(top, text="km/h", variable=self.units_var, value="km/h",
-                        command=self._toggle_units).pack(side="right")
-        ttk.Radiobutton(top, text="mph", variable=self.units_var, value="mph",
-                        command=self._toggle_units).pack(side="right")
+        tk.Radiobutton(top, text="km/h", variable=self.units_var, value="km/h",
+                       command=self._toggle_units, bg="#0b0d10", fg="#d7e2ea",
+                       selectcolor="#1c2733", activebackground="#0b0d10",
+                       activeforeground="#ffffff", highlightthickness=0)\
+            .pack(side="right")
+        tk.Radiobutton(top, text="mph", variable=self.units_var, value="mph",
+                       command=self._toggle_units, bg="#0b0d10", fg="#d7e2ea",
+                       selectcolor="#1c2733", activebackground="#0b0d10",
+                       activeforeground="#ffffff", highlightthickness=0)\
+            .pack(side="right")
 
         body = ttk.Frame(self.root)
         body.pack(fill="both", expand=True, padx=8, pady=2)
@@ -746,6 +756,19 @@ class Cockpit:
         for i, (t, c) in enumerate(qbtn):
             ttk.Button(q, text=t, command=c).grid(
                 row=i // 4, column=i % 4, padx=2, pady=2, sticky="ew")
+
+        # ---------------- CAN BUS tab (live frame monitor, decoded names).
+        # Own tab: the Cockpit tab's height budget (~490 px) can't hold the
+        # monitor inline, so it got clipped off-screen in the old layout.
+        canbus = ttk.Frame(nb)
+        nb.add(canbus, text="CAN BUS")
+        self.bus_txt = tk.Text(canbus, height=16, bg="#0a0a0a", fg="#cfd8e0",
+                               font=("Consolas", 8), relief="flat", padx=4,
+                               pady=2, wrap="none")
+        self.bus_sb = ttk.Scrollbar(canbus, command=self.bus_txt.yview)
+        self.bus_txt.configure(yscrollcommand=self.bus_sb.set)
+        self.bus_txt.pack(side="left", fill="both", expand=True)
+        self.bus_sb.pack(side="right", fill="y")
 
         # ---------------- SERVICE tab (ignition/gear/switch/fault/cruise/AP)
         service = ttk.Frame(nb)
@@ -834,22 +857,26 @@ class Cockpit:
                           pady=(6, 0))
 
     def _build_footer(self):
-        f = ttk.LabelFrame(self.root, text="inputs & bus")
+        # Built from plain tk widgets (no ttk): native themes ignore ttk
+        # Style settings and painted this footer green-on-light -> unreadable
+        f = tk.Frame(self.root, bg="#101418")
         f.pack(fill="x", padx=8, pady=(0, 6))
         kb = ("KEYBOARD   W/↑ gas   S/↓ brake   A/D steer   P R N D gear   "
               "I ignition   SPACE parkbrake   H hazards   R reset")
         xb = ("controller   LS steer   RS gas/brake   LT/RT gas·brake   A D   B N   "
               "X parkbrake   Y reset   LB/RB P·D   BACK hazards   START ignition   "
               "C autopilot")
-        ttk.Label(f, text=kb, foreground="#8fa").pack(anchor="w")
+        tk.Label(f, text=kb, bg="#101418", fg="#d7e2ea",
+                 font=("Consolas", 9), anchor="w").pack(fill="x")
         gp = "controller: n/a (keyboard only)" if not _HAS_SDL else \
              ("controller: ONLINE" if self._pad_available else "controller: none connected")
-        ttk.Label(f, text=xb + "   [" + gp + "]", foreground="#8fa").pack(
-            anchor="w")
-        ttk.Label(f, text="Bus broadcast / drive IDs       0x100 ENG   0x110 CHAS   "
+        tk.Label(f, text=xb + "   [" + gp + "]", bg="#101418", fg="#d7e2ea",
+                 font=("Consolas", 9), anchor="w").pack(fill="x")
+        tk.Label(f, text="Bus broadcast / drive IDs       0x100 ENG   0x110 CHAS   "
                           "0x120 STEER+lights   0x130 BODY   0x140 GEAR/fuel/odo   "
                           "0x400 DRIVE_IN (thr·brk·gear·steer)   diag 0x7DF->0x7E8",
-                  foreground="#79c").pack(anchor="w")
+                 bg="#101418", fg="#9fc7e8", font=("Consolas", 9),
+                 anchor="w").pack(fill="x")
 
     # ------------------------------------------------------------- controls
     def _send_inject(self):
@@ -1076,6 +1103,31 @@ class Cockpit:
         self._render_cluster(st)
         self._render_lamps(st)
         self._render_live(st)
+        self._render_bus()
+
+    def _render_bus(self):
+        """Live CAN BUS monitor: every RX frame, decoded per function."""
+        if not getattr(self, "bus_txt", None):
+            return
+        n = len(self.frame_history)
+        if n == getattr(self, "_bus_rendered", -1):
+            return
+        self._bus_rendered = n
+        self.bus_txt.configure(state="normal")
+        self.bus_txt.delete("1.0", "end")
+        for rec in self.frame_history[-36:]:
+            try:
+                dec = decode_frame(rec)
+                fields = "  ".join(f"{k} {v}"
+                                   for k, v in dec["fields"].items())
+                line = (f"{rec.get('ts', '')}  0x{dec['id']:03X} "
+                        f"{dec['name']:<9} {dec['hex']:<20} | {fields}")
+            except Exception:
+                line = (f"{rec.get('ts', '')}  {rec.get('id', '?'):#x} "
+                        f"{rec.get('data', '')}")
+            self.bus_txt.insert("end", line + "\n")
+        self.bus_txt.configure(state="disabled")
+        self.bus_txt.see("end")
 
     def _dtc_text(self, st):
         parts = []
@@ -1098,8 +1150,9 @@ class Cockpit:
         speed_kmh = abs(st.get("speed", 0.0))
         self._scroll += speed_kmh / 3.6 * 0.1
         steer = st.get("steer", 0.0) / 100.0
-        self._steer_ofs += (-steer * 80 - self._steer_ofs) * 0.12
-        road_center = w / 2.0 + self._steer_ofs
+        # road stays fixed; the CAR moves laterally within it
+        self._car_lat = max(-90.0, min(90.0, steer * 90.0))
+        road_center = w / 2.0
         road_w = 300.0
         cv.create_rectangle(road_center - road_w / 2, 0, road_center + road_w / 2,
                             h, fill="#1a1a1a", outline="")
@@ -1112,7 +1165,7 @@ class Cockpit:
             yy = (k * spacing + self._scroll) % h
             cv.create_line(road_center, yy - spacing / 2, road_center,
                            yy + spacing / 2, fill="#e8c93a", width=4)
-        cx = road_center
+        cx = road_center + self._car_lat
         cy = h * 0.78
         car_w, car_h = 74, 128
         sw = st.get("switches", {})
@@ -1182,11 +1235,11 @@ class Cockpit:
         trip = st.get("trip", 0.0)
         maf = st.get("maf", 0.0)
         runmin = st.get("runtime", 0.0) / 60.0
-        # 3x3 tiled gauges, evenly spaced, NO overlap
+        # 3x3 tiled gauges, evenly spaced, NO overlap; caption BELOW dial
         ncol, nrow = 3, 3
-        gx0, gy0 = w / (ncol * 2), h / (nrow * 2)
-        gx_step, gy_step = w / ncol, h / nrow
-        rad = min(gx_step, gy_step) * 0.34
+        gx0, gy0 = w / (ncol * 2), 50.0
+        gx_step, gy_step = w / ncol, 130.0
+        rad = min(gx_step, gy_step) * 0.28
         cfg = [
             ("RPM", rpm, 6400, "#ff6b3d", "rpm"),
             ("SPEED", spd_disp, spd_max, "#34d1ce", self._spdu()),
@@ -1203,9 +1256,8 @@ class Cockpit:
             cx = gx0 + col_i * gx_step
             cy = gy0 + row * gy_step
             _draw_gauge(cv, cx, cy, rad, val, vmax, label, col, units=unit)
-        # odo row
-        y = h - 34
-        cv.create_text(12, y, anchor="w",
+        # odo / trip / run on a clean bottom band (never overlaps dials)
+        cv.create_text(w / 2, h - 6, anchor="s",
                        text=f"ODO {odo:06.0f} km   {self._spdu()}: "
                             f"{self._spd(spd):.0f}   trip {trip:.1f} km   "
                             f"run {runmin:.0f} min",
@@ -1245,7 +1297,7 @@ class Cockpit:
         if st.get("limp"):
             add(("LIMP"), "#ff9f0a")
         if not flag:
-            cv.create_text(w / 2, 24, text="ALL OK", fill="#3f9",
+            cv.create_text(w / 2, 24, text="ALL OK", fill="#e8e8e8",
                            font=("Helvetica", 11, "bold"))
             return
         n = len(flag)

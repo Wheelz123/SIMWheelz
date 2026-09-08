@@ -91,7 +91,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.1"
+__version__ = "0.3"
 
 # --------------------------------------------------------------------------- #
 #  Constants
@@ -1055,6 +1055,7 @@ class CarSim:
         self._last_pb = 0.0
         self._stop = False
         self._last_frames = []
+        self._sent_frames = {}             # id -> last broadcast bytes (TCP)
         self.wire_pending_mf = None        # (rest, seq, ecu_id) in wire mode
 
     # ---------------------------------------------------------- client mgmt
@@ -1301,13 +1302,19 @@ class CarSim:
                     if self.wire is not None:
                         self.wire.send(fid, data)
                     else:
+                        # TCP bench: always hand the cockpit a FULL per-ID
+                        # snapshot so every gauge/bus row updates every tick
+                        self._sent_frames[fid] = data
                         out.append({"id": fid, "dlc": len(data),
                                     "data": data.hex().upper()})
                         for c in self._opened_clients():
                             c.send_frame(fid, data)
-                    self._last_frames = out
-            if self.wire is None:
+            if self.wire is not None:
                 self._last_frames = out
+            else:
+                self._last_frames = [
+                    {"id": fid, "dlc": len(d), "data": d.hex().upper()}
+                    for fid, d in sorted(self._sent_frames.items())]
 
         # 10 Hz state stream to the cockpit
         if int(now * 10.0) != getattr(self, "_last_state_tick", -1):
