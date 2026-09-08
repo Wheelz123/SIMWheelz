@@ -1535,36 +1535,38 @@ class Cockpit:
     def _toggle_units(self):
         self.units = "mph" if self.units_var.get() == "mph" else "kmh"
 
+    def _key_drive(self, thr, brk, steer, src):
+        """Send one keyboard drive command per *real* change.
+
+        Holding a key fires OS auto-repeat events (plus the final release),
+        which used to log 10+ identical TX lines per second into the CAN BUS
+        monitor.  Sliders still track every event; the bus gets a single TX
+        per actual change (press / release / new value).
+        """
+        cmd = (thr, brk, steer)
+        if cmd == getattr(self, "_last_key_drive", None):
+            return
+        self._last_key_drive = cmd
+        self.client.send({"t": "input", "throttle": thr, "brake": brk,
+                          "steer": steer})
+        self._log_tx(*build_drive(throttle=thr, brake=brk, steer=steer,
+                                  gear=self._state.get("gear", "D")),
+                     src=src)
+
     def _key_thr(self, v):
         self.thr_var.set(v * 100.0)
-        self.client.send({"t": "input", "throttle": v,
-                          "brake": self.brk_var.get() / 100.0,
-                          "steer": self.steer_var.get() / 100.0})
-        self._log_tx(*build_drive(
-            throttle=v, brake=self.brk_var.get() / 100.0,
-            steer=self.steer_var.get() / 100.0,
-            gear=self._state.get("gear", "D")),
-            src=f"key thr {v:.0f}")
+        self._key_drive(v, self.brk_var.get() / 100.0,
+                        self.steer_var.get() / 100.0, f"key thr {v:.0f}")
 
     def _key_brk(self, v):
         self.brk_var.set(v * 100.0)
-        self.client.send({"t": "input", "throttle": self.thr_var.get() / 100.0,
-                          "brake": v, "steer": self.steer_var.get() / 100.0})
-        self._log_tx(*build_drive(
-            throttle=self.thr_var.get() / 100.0, brake=v,
-            steer=self.steer_var.get() / 100.0,
-            gear=self._state.get("gear", "D")),
-            src=f"key brk {v:.0f}")
+        self._key_drive(self.thr_var.get() / 100.0, v,
+                        self.steer_var.get() / 100.0, f"key brk {v:.0f}")
 
     def _key_steer(self, v):
         self.steer_var.set(v * 100.0)
-        self.client.send({"t": "input", "throttle": self.thr_var.get() / 100.0,
-                          "brake": self.brk_var.get() / 100.0, "steer": v})
-        self._log_tx(*build_drive(
-            throttle=self.thr_var.get() / 100.0,
-            brake=self.brk_var.get() / 100.0, steer=v,
-            gear=self._state.get("gear", "D")),
-            src=f"key steer {v:.0f}")
+        self._key_drive(self.thr_var.get() / 100.0,
+                        self.brk_var.get() / 100.0, v, f"key steer {v:.0f}")
 
     def _key_gear(self, g):
         self.client.send({"t": "gear", "gear": g})
