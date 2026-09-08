@@ -91,7 +91,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.3.1"
+__version__ = "0.3.3"
 
 # --------------------------------------------------------------------------- #
 #  Constants
@@ -249,6 +249,22 @@ class CarPhysics:
             self.tc_pulse = False
             self._was_rev_limit = False
             self._was_tc = False
+            self.load_pct = 0.0
+            self.maf = 0.0
+            # engine-off coast-down: rolling drag + rolling resistance +
+            # brakes decelerate a moving car to a stop instead of freezing
+            # it at speed (the old bug left you stuck doing 35 km/h).
+            drag = 0.42 * self.v * abs(self.v)
+            roll = 0.015 * MASS * 9.81 * (1.0 if self.v >= 0 else -1.0)
+            if self.v == 0.0:
+                roll = 0.0
+            brake_f = self.brake * 9000.0 * (1.0 if self.v >= 0 else -1.0)
+            if abs(self.v) < 0.05 and brake_f * math.copysign(1, self.v) < 0:
+                brake_f = 0.0
+            a = -(drag + roll + brake_f) / MASS
+            self.v = clamp(self.v + a * dt, -30.0 / 3.6, MAX_SPEED_KMH / 3.6)
+            if abs(self.v) < 0.02:
+                self.v = 0.0
         else:
             # converter slip: rpm = idle + throttle*2600*(1 - v/30)
             conv = IDLE_RPM + throttle * 2600.0 * max(0.0, 1.0 - abs(self.v) / 30.0)
@@ -793,16 +809,22 @@ class SlcanClient:
                 if not chunk:
                     break
                 self._buf += chunk
-                while b"\r" in self._buf or b"\n" in self._buf:
-                    line, self._buf = self._buf.split(b"\r", 1)
-                    line = line.strip(b"\n").decode("ascii", "replace").strip()
+                while (b"\r" in self._buf) or (b"\n" in self._buf):
+                    # split on whichever terminator comes first (CR or LF)
+                    i = self._buf.find(b"\r")
+                    j = self._buf.find(b"\n")
+                    if i == -1:
+                        i = j
+                    elif j != -1 and j < i:
+                        i = j
+                    line, self._buf = self._buf[:i], self._buf[i + 1:]
+                    line = line.strip().decode("ascii", "replace")
                     if line:
                         self._cmd(line)
         except OSError:
             pass
         finally:
             self.sim.drop_client(self)
-
     def _cmd(self, line):
         c = line[0].upper() if line else ""
         if c == "S":                     # bitrate (Lawicel codes, logged only)
