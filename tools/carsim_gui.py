@@ -715,16 +715,18 @@ class Cockpit:
     def _hint_text(self, st):
         """Engine/gear-aware footer hint: what the next key will do."""
         gear = st.get("gear", "P")
-        if not st.get("engine_on"):
-            if gear in ("P", "N"):
-                return ("ENGINE OFF gear %s | press i / START to crank, "
-                        "then D and hold %s" % (gear, "↑"))
-            return ("ENGINE OFF gear %s | shift to P or N, then i / START"
-                    % gear)
+        # Park always carries the start-up instruction, whether the engine
+        # is running or not.
         if gear == "P":
             return ("You must start the car in park by hitting the I (ignition) "
                     "key. Then you must shift the car into drive by hitting "
                     "the D key.")
+        if not st.get("engine_on"):
+            if gear == "N":
+                return ("ENGINE OFF gear N | press i / START to crank, "
+                        "then D and hold %s" % "↑")
+            return ("ENGINE OFF gear %s | shift to P or N, then i / START"
+                    % gear)
         if gear == "N":
             return "neutral: no drive - press D"
         if gear == "R":
