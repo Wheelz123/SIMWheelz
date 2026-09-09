@@ -3,18 +3,16 @@
 A virtual car that speaks **real OBD-II / UDS and CAN over SLCAN**, with a
 drivable game cockpit on top. No vehicle or CAN hardware is required: the whole
 bus — engine, TCM and ABS ECUs plus the classic broadcast frames — lives in
-`tools/carsim.py`, and `tools/carsim_gui.py` is the dashboard you drive it
-from. **One command starts the entire bench.** Use the sim to develop and test
+`tools/carsim.py`, and `tools/carsim_gui.py` is the dashboard you drive it from.
+**One command starts the entire bench.** Use the sim to develop and test
 diagnostic clients, injection tooling and CAN monitors against a deterministic
-setup, then bind the same sim to a wired SocketCAN bus if you want other bus
-participants involved.
+setup.
 
 | File | What it is |
 |---|---|
-| `tools/carsim.py` | Physics engine + ECU cluster (engine / TCM / ABS) + SLCAN-over-TCP server + JSON control channel + optional SocketCAN (wired CAN bus) mode + ICSim-style `--follower` drive input |
+| `tools/carsim.py` | Physics engine + ECU cluster (engine / TCM / ABS) + SLCAN server + JSON control channel + ICSim-style `--follower` drive input |
 | `tools/carsim_gui.py` | tkinter cockpit: canvas road, 3×3 gauge cluster, lamps + live data, CAN console + quick inject, CAN BUS monitor, keyboard driving, cruise + 3-phase autopilot, body switches, faults, units |
-| `run_cockpit.sh` | Launcher for the cockpit — the single entry point (args pass through) |
-| `run_sim.sh` | Launcher for the engine alone — idempotent, won't double-start a running sim |
+| `run_cockpit.sh` | Launcher for the cockpit — **the single entry point** (args pass through) |
 | `run_tests.sh` | Full headless verification (compile + selftest + `--check` + both e2e) |
 
 Requires **Python 3.10+** (tkinter for the GUI).
@@ -24,7 +22,7 @@ Requires **Python 3.10+** (tkinter for the GUI).
 ## 1. Quick start — one command
 
 ```bash
-./run_cockpit.sh        # or: python3 tools/carsim_gui.py
+./run_cockpit.sh
 ```
 
 That is the whole story. If no sim is listening on the loopback control port,
@@ -43,19 +41,14 @@ sim already listening on 127.0.0.1:20103 - reusing it (engine not started)
 
 Behind the scenes:
 
-- **Auto-start** only fires for loopback hosts (`""`, `localhost`, `127.0.0.1`,
-  `::1`). Point `--host` at a remote sim and the cockpit simply connects.
+- The auto-started engine runs with **`--follower`**, so quick-inject and CAN
+  INJECT frames (`400#…`) actually move the car.
 - The auto-started engine is stopped when the cockpit exits (SIGTERM,
   escalating to SIGKILL) — no orphan sims. Its console output is appended to
-  the engine log (`tempfile.gettempdir()` + `/carsim_engine.log`, usually
-  `/tmp/carsim_engine.log`).
+  the engine log (`/tmp/carsim_engine.log`).
 - The cockpit waits up to ~5 s for the engine to open its ports and reports
   clearly if the spawn failed, the engine exited early, or the port never
   opened — each failure message points at the engine log.
-- `./run_sim.sh` starts the engine on its own and is **idempotent**: if a sim
-  already listens on the control port it prints `carsim already listening on
-  127.0.0.1:20103 - nothing to start` and exits 0 (`--help` / `--version` /
-  `--selftest` always run through). Extra args pass to `tools/carsim.py`.
 - `./run_tests.sh` runs the whole headless suite against a fresh sim.
 
 > If you start the engine by hand, remember `--follower` — without it,
@@ -68,8 +61,7 @@ Behind the scenes:
 ### Layout
 The cockpit is a single window with three non-overlapping columns (road · tiled
 3×3 gauge cluster · lamps / live data / CAN console), plus a footer of keyboard
-instructions. The footer is always visible under plain-tk (no ttk theme
-overrides).
+instructions.
 
 ### Keyboard
 ```
@@ -148,8 +140,7 @@ inject. Five frames repeat on the bus:
   (`chg`); any frame the cockpit itself sent is **amber** (`tx`). In the middle
   of a live flood you spot the moment you flipped a switch instantly.
 - **FREEZE.** Stops the live monitor so you can scroll back and click-copy a
-  frame; the button flips to `LIVE >>` to resume. Dragging the scrollbar up
-  also freezes into scrollback.
+  frame; the button flips to `LIVE >>` to resume.
 
 ### Console / quick inject
 The **CAN INJECT** bar parses `cansend`-style `ID#DATA` lines (e.g.
@@ -176,40 +167,35 @@ python3 tests/ap_phase_e2e.py               # autopilot sequence (needs sim runn
 ```
 
 Expected tails: `carsim selftest: ALL PASS`, `carsim_gui headless check: ALL
-PASS`, `E2E ALL PASS`, `ap phase-machine e2e: ALL PASS`. Point the e2e tests at
-another host/port with `CARSIM_HOST` / `CARSIM_PORT`.
+PASS`, `E2E ALL PASS`, `ap phase-machine e2e: ALL PASS`.
 
 ---
 
-## 6. Advanced — running the engine separately
+## 6. Running the engine on its own (optional)
 
-The cockpit normally brings the engine with it, but you can start the two
-halves independently (e.g. engine on this host, cockpit elsewhere):
+The cockpit normally brings the engine with it, but you can start the engine
+alone if you want to drive it over the control channel yourself:
 
 ```bash
 ./run_sim.sh --follower                     # engine, ctrl :20103 / slcan :20102
-./run_cockpit.sh                            # cockpit, connects to 127.0.0.1:20103
 ```
 
 Engine CLI (`tools/carsim.py --help` for the rest):
 
 | Option | Meaning |
 |---|---|
-| `--host ADDR` | bind address (default: all interfaces) |
-| `--slcan-port N` | SLCAN-over-TCP port (default **20102**) |
+| `--slcan-port N` | SLCAN port (default **20102**) |
 | `--ctrl-port N` | JSON control port (default **20103**) |
-| `--iface can0` | **SocketCAN mode**: ECUs + broadcasts on a real CAN wire, TCP SLCAN server off |
-| `--tcp-also` | keep the TCP SLCAN server in `--iface` mode too |
-| `--follower` | ICSim-style drive: treat frames 0x100/0x110/0x120/0x140/0x400 as remote drive input |
+| `--follower` | ICSim-style drive: treat frames 0x100/0x110/0x120/0x140/0x400 as drive input |
 | `--no-traffic` | silent bench: no broadcast frames, only ECU replies |
 | `--ecus 1\|2\|3` | 1 = engine only, 2 = +TCM, 3 = +ABS (default 3) |
 | `--selftest` | headless physics/protocol assertions, then exit |
 | `--version` | print version and exit |
 
-The cockpit accepts the same `--host` / `--port` / `--slcan-port` flags, so a
-remote cockpit is `python3 tools/carsim_gui.py --host 192.168.1.50`. For the
-wire-level sessions (raw SLCAN over `nc`, the JSON control channel, and
-SocketCAN bring-up) see `docs/QUICKSTART.md` § 4.
+`--help` / `--version` / `--selftest` always run through, and `./run_sim.sh` is
+idempotent — if a sim already listens on the control port it prints
+`carsim already listening on 127.0.0.1:20103 - nothing to start` and exits 0
+instead of crashing with `Address already in use`.
 
 ---
 
