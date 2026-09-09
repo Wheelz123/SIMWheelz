@@ -1,6 +1,6 @@
 # carsim — drivable virtual CAN simulator + cockpit
 
-A virtual car that speaks **real OBD-II / UDS over SLCAN-over-TCP**, with a
+A virtual car that speaks **real OBD-II / UDS and CAN over SLCAN**, with a
 drivable game cockpit on top. No vehicle or CAN hardware is required: the whole
 bus — engine, TCM and ABS ECUs plus the classic broadcast frames — lives in
 `tools/carsim.py`, and `tools/carsim_gui.py` is the dashboard you drive it
@@ -32,13 +32,10 @@ python3 tools/carsim_gui.py
 Or use the launchers:
 
 ```bash
-./run_sim.sh          # starts carsim.py; extra args pass through (e.g. --host 0.0.0.0)
+./run_sim.sh          # starts carsim.py; extra args pass through
 ./run_cockpit.sh      # starts the GUI; extra args pass through
 ./run_tests.sh        # headless self-test (compile + selftest + --check + both e2e)
 ```
-
-Default ports: **20102** SLCAN-over-TCP and **20103** JSON control. Point the
-GUI or the e2e tests at another host with `--host` / `CARSIM_HOST`.
 
 ---
 
@@ -138,68 +135,7 @@ The **CAN INJECT** bar parses `cansend`-style `ID#DATA` lines (e.g.
 
 ---
 
-## 5. Talking to it from the command line
-
-SLCAN-over-TCP (Lawicel framing):
-
-```bash
-# nc 127.0.0.1 20102   then:
-V   -> V1013
-O   -> open the receive channel (frames start streaming)
-C   -> close the receive channel
-```
-
-JSON control channel (`20103`), one command per line:
-
-```json
-{"t":"reset"}
-{"t":"ignition","on":true}
-{"t":"gear","gear":"D"}
-{"t":"input","throttle":0.7,"brake":0.0,"steer":0.0}
-{"t":"switch","name":"door_fl","on":true}
-{"t":"fault","name":"mil","on":true}
-{"t":"cruise","on":true}
-```
-
-The sim pushes a full state snapshot per tick (gear, rpm, speed, odo, lamps,
-DTCs, faults, `frames`, `events`, `switches`).
-
----
-
-## 6. SocketCAN (wired CAN bus) mode
-
-```bash
-sudo ip link set can0 up type can bitrate 500000
-python3 tools/carsim.py --iface can0 --follower       # ECUs + traffic + drive on the wire
-python3 tools/carsim.py --iface can0 --tcp-also       # ...and keep TCP SLCAN too
-```
-
-The ECUs answer functional requests on `0x7DF` and stream `0x100–0x140`
-exactly like bench mode. With `--follower`, a real steering wheel / pedal set
-(or `cansend can0 400#…`) drives the simulated car.
-
----
-
-## 7. Full CLI reference
-
-`tools/carsim.py`
-
-| Option | Meaning |
-|---|---|
-| `--host ADDR` | bind address (default: all interfaces) |
-| `--slcan-port N` | SLCAN-over-TCP port (default 20102) |
-| `--ctrl-port N` | JSON control port (default 20103) |
-| `--iface can0` | SocketCAN mode: ECUs + broadcasts on a real CAN wire, TCP SLCAN off |
-| `--tcp-also` | keep the TCP SLCAN server in `--iface` mode |
-| `--follower` | ICSim-style drive: treat bus frames as remote drive input |
-| `--no-traffic` | silent bench: no broadcast frames, only ECU replies |
-| `--ecus 1\|2\|3` | 1 engine, 2 +TCM, 3 +ABS (default 3) |
-| `--selftest` | headless physics/protocol assertions, then exit |
-| `--version` | print version and exit |
-
----
-
-## 8. Self-tests (headless, no display)
+## 5. Self-tests (headless, no display)
 
 ```bash
 python3 -m py_compile tools/carsim.py tools/carsim_gui.py
@@ -214,28 +150,5 @@ ALL PASS`, `E2E ALL PASS`, `ap phase-machine e2e: ALL PASS`. `./run_tests.sh`
 runs them all against a freshly-started sim.
 
 ---
-
-## 9. Troubleshooting
-
-- **GUI says "connecting…" forever** — the sim isn't running, or you pointed
-  `--host` at the wrong address. Start the sim first, then the GUI.
-- **Injected frames don't move the car** — the sim needs `--follower`
-  (frames still appear in the monitor without it).
-- **Gears won't shift** — R/P are blocked above 8 km/h and you cannot crank in
-  D. Brake, shift to P/N, then start.
-- **Cruise won't engage** — it needs D **and** ≥ 40 km/h.
-- **The monitor is a wall of text** — look for the **cyan** (just-changed)
-  and **amber** (sent by the cockpit) lines, and hit **FREEZE** to read a
-  specific frame.
-
----
-
-## 10. Tests & docs
-
-| File | Purpose |
-|---|---|
-| `docs/QUICKSTART.md` | full CLI / keybinding / injection reference |
-| `tests/cockpit_e2e.py` | JSON drive-cycle e2e (`CARSIM_HOST`/`CARSIM_PORT` overridable) |
-| `tests/ap_phase_e2e.py` | autopilot 3-phase state-machine replay |
 
 MIT licensed.
