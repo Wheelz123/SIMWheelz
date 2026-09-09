@@ -67,7 +67,7 @@ except Exception:                       # non-GUI env / --check still works
     _HAS_TK = False
 
 
-__version__ = "0.9.10"
+__version__ = "0.9.11"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -667,7 +667,7 @@ class Cockpit:
                                     on_log=self._log)
         self.injector = CanInjector(host, ctrl_port, on_log=self._log)
 
-        self.root.title("CAN FIRECOCKPIT - carsim")
+        self.root.title("CAN FIRECOCKPIT - SIMWheelz")
         self.root.configure(bg="#0b0d10")
         self._build_ui()
         self._bind_keys()
