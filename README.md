@@ -12,7 +12,7 @@ A virtual car that speaks **real OBD-II / UDS and CAN** with a drivable game coc
 ```bash
 ./run_cockpit.sh
 ```
-
+IMPORTANT: When you open the game, you must start the car like any vehicle in real life. That means the vehicle will be in park when the program starts. Press I to start the ignition. Then press D to put the car in drive. Follow the driving instructions on the footer of the vehicle after this. Enjoy!
 
 ---
 
