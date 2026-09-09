@@ -143,7 +143,7 @@ to the clipboard; double-click loads it into the inject box.
 ### Faults / raw bus
 
 - Fault checkboxes inject failures (MIL: misfire P0300, overheat P0217, flat
-  tyre, …); the OBD/UDS clear paths and the reset button remove them.
+  tire); the OBD/UDS clear paths and the reset button remove them.
 - The CAN BUS monitor shows the live stream: 0x100 engine @20 ms, 0x110
   chassis @20 ms, 0x120 steering/lights @50 ms, 0x130 body @50 ms, 0x140
   gear/fuel/odo @100 ms — plus anything you inject (changed frames **cyan**,
