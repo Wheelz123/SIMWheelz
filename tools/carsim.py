@@ -27,7 +27,9 @@ A diagnostic request frame injected with CAN INJECT is observed but never
 answered here — loopback has no reply channel.  The ISO-TP ECU side of the
 protocol (single/multi-frame replies, FlowControl pacing, DTCs, VIN) is
 exercised headlessly by --selftest.  With --follower, injected drive frames
-(0x100/0x110/0x120/0x140/0x400) are folded into the physics as remote input.
+(0x100/0x110/0x120/0x140/0x400) are folded into the physics as remote
+input.  The 0x120 STEER lamp bits (headlights / highbeam / wipers / hazard /
+turn) latch the matching switches, so the lamps can be hacked off the bus.
 
 Fault deck (toggles the same way the GUI shows them):
     mil      -> P0300  (MIL on, rpm jitter)
@@ -53,7 +55,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # --------------------------------------------------------------------------- #
 #  Constants
@@ -945,7 +947,10 @@ class CarSim:
 
     # -------------------------------------------------------- drive follower
     def _apply_drive_frame(self, can_id, data):
-        """ICSim-style: fold external drive frames into the physics."""
+        """ICSim-style: fold external drive frames into the physics.
+
+        0x120 lamp bits latch the matching switches, so an injected
+        STEER frame can flip headlights / highbeam / wipers / hazard / turn."""
         ev = []
         if not data:
             return
@@ -963,11 +968,19 @@ class CarSim:
         elif can_id == FRAME_CHASSIS:                # chassis frame: brake
             if len(data) >= 2:
                 self.phys.brake = clamp(data[1] / 100.0, 0.0, 1.0)
-        elif can_id == FRAME_STEER:                  # steer frame
+        elif can_id == FRAME_STEER:                  # steer + lamp bits
             s = data[0]
             if s >= 128:
                 s -= 256
             self.phys.steer = clamp(s / 100.0, -1.0, 1.0)
+            if len(data) >= 2:                       # 0x120 lamp bits latch switches
+                for _n, _b in (("headlights", 0x10), ("highbeam", 0x08),
+                               ("wipers", 0x20), ("hazard", 0x04),
+                               ("left", 0x01), ("right", 0x02)):
+                    _on = bool(data[1] & _b)
+                    if self.switches.get(_n) != _on:
+                        self.switches[_n] = _on
+                        ev.append(f"{_n} {'on' if _on else 'off'} via CAN INJECT")
         elif can_id == FRAME_GEAR:                   # gear frame
             g = GEAR_FROM.get(data[0] & 0x0F)
             if g:

@@ -124,6 +124,12 @@ Frame legend: **0x100** ENG · **0x110** CHAS · **0x120** STEER+lights ·
 · gear · steer bytes) · diag **0x7DF → 0x7E8**. Click a CAN BUS line to copy it
 to the clipboard; double-click loads it into the inject box.
 
+Hacking the lamps: in `--follower` mode the **0x120** STEER frame's lamp
+bits latch the switches, so `120#0010…` turns headlights on, `120#0020…`
+wipers, `120#0004…` hazard, `120#0008…` highbeam, `120#0000…` all off
+(byte 1: `0x01` left · `0x02` right · `0x04` hazard · `0x08` highbeam ·
+`0x10` headlights · `0x20` wipers).
+
 > Injected frames move the car only when the sim runs with `--follower` (the
 > auto-started engine always does). Without it, frames still enter the bus
 > stream but the physics ignores them. Quick-inject buttons (throttle

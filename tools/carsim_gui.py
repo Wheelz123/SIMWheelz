@@ -67,7 +67,7 @@ except Exception:                       # non-GUI env / --check still works
     _HAS_TK = False
 
 
-__version__ = "0.9.8"
+__version__ = "0.9.9"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -1712,8 +1712,7 @@ class Cockpit:
     def _render(self):
         st = self._state
         self.status_lbl.configure(
-            text=f"status: {self.client.status}  ctrl:{self.host}:{self.port}"
-                 f"  bus:{self.injector.status} via ctrl {self.host}:{self.port}")
+            text=f"status: {self.client.status}")
         # Truthful START/RUNNING: _ign() sets the label optimistically, but
         # the sim may reject the crank (engine off while in D, etc.), so the
         # label is driven from state.engine_on every frame.
@@ -2372,7 +2371,7 @@ def main():
         print("tkinter not available in this environment", file=sys.stderr)
         return 1
 
-    # Single-entry cockpit (v0.9.8): when pointed at a loopback sim that is
+    # Single-entry cockpit (v0.9.9):
     # not yet listening, auto-start the bundled engine as --follower so a
     # bare `python3 tools/carsim_gui.py` brings up the whole bench.  A sim
     # that is already running on the ctrl port is left completely untouched.
