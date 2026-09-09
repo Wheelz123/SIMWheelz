@@ -1,4 +1,4 @@
-# carsim — drivable virtual CAN simulator + cockpit
+# CarSimWheelz — drivable virtual CAN simulator + cockpit
 
 A virtual car that speaks **real OBD-II / UDS and CAN over SLCAN**, with a
 drivable game cockpit on top. No vehicle or CAN hardware is required: the whole
