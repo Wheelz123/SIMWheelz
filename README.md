@@ -1,23 +1,8 @@
 # CarSimWheelz — drivable virtual CAN simulator + cockpit
 
 A virtual car that speaks **real OBD-II / UDS and CAN** over a loopback-only
-JSON control channel, with a
-drivable game cockpit on top. No vehicle or CAN hardware is required: the whole
-bus — engine, TCM and ABS ECUs plus the classic broadcast frames — lives in
-`tools/carsim.py`, and `tools/carsim_gui.py` is the dashboard you drive it from.
-**One command starts the entire bench.** Use the sim to develop and test
-diagnostic clients, injection tooling and CAN monitors against a deterministic
-setup.
-
-| File | What it is |
-|---|---|
-| `tools/carsim.py` | Physics engine + ECU cluster (engine / TCM / ABS) + JSON control channel + loopback CAN INJECT + ICSim-style `--follower` drive input |
-| `tools/carsim_gui.py` | tkinter cockpit: canvas road, 3×3 gauge cluster, lamps + live data, CAN console + quick inject, CAN BUS monitor, keyboard driving, cruise + 3-phase autopilot, body switches, faults, units |
-| `run_cockpit.sh` | Launcher for the cockpit — **the single entry point** (args pass through) |
-| `run_tests.sh` | Full headless verification (compile + selftest + `--check` + both e2e) |
-
-Requires **Python 3.10+** (tkinter for the GUI).
-
+JSON control channel, with a drivable game cockpit on top. In this you can simulate what a real attacker who gains access to a can bus could do, reverse engineer can frames, and learn about vehicle vulnerabilities in a fun to play game interface.  No vehicle or CAN hardware is required: the whole bus — engine, TCM and ABS ECUs plus the classic broadcast frames — lives in `tools/carsim.py`, and `tools/carsim_gui.py` is the dashboard you drive it from.
+**One command starts the entire bench.** 
 ---
 
 ## 1. Quick start — one command
@@ -26,34 +11,6 @@ Requires **Python 3.10+** (tkinter for the GUI).
 ./run_cockpit.sh
 ```
 
-That is the whole story. If no sim is listening on the loopback control port,
-the cockpit **auto-starts the bundled engine** as `--follower` (so injected
-frames actually drive the car) and prints:
-
-```
-engine auto-started (ctrl 127.0.0.1:20103); log in /tmp/carsim_engine.log
-```
-
-If a sim is already running, it is left completely untouched:
-
-```
-sim already listening on 127.0.0.1:20103 - reusing it (engine not started)
-```
-
-Behind the scenes:
-
-- The auto-started engine runs with **`--follower`**, so quick-inject and CAN
-  INJECT frames (`400#…`) actually move the car.
-- The auto-started engine is stopped when the cockpit exits (SIGTERM,
-  escalating to SIGKILL) — no orphan sims. Its console output is appended to
-  the engine log (`/tmp/carsim_engine.log`).
-- The cockpit waits up to ~5 s for the engine to open its ports and reports
-  clearly if the spawn failed, the engine exited early, or the port never
-  opened — each failure message points at the engine log.
-- `./run_tests.sh` runs the whole headless suite against a fresh sim.
-
-> If you start the engine by hand, remember `--follower` — without it,
-> injected `0x400` DRIVE_IN frames appear on the bus but never move the car.
 
 ---
 
@@ -131,83 +88,32 @@ inject. Five frames repeat on the bus:
 | `0x400` | DRIVE_IN | on inject | throttle · brake · gear · steer |
 
 ### It's readable now
-- **Named decode.** `0x130` prints the doors by name instead of a bitmask
+- **Names decoded.** `0x130` prints the doors by name instead of a bitmask
   number, e.g. `doors FL,FR` or `all closed`, plus `trunk/hood/belt`. You can
   tell exactly which door is open without decoding hex.
-- **Nothing clips.** The monitor wraps long frames onto a continuation line
-  (`wrap=char`), so a dense line like `| doors FL  trunk closed  hood closed
-  belt no` is fully visible instead of being cut off at the window edge.
 - **Change highlight.** The frame that *just* changed is shown in **cyan**
-  (`chg`); any frame the cockpit itself sent is **amber** (`tx`). In the middle
+  (`chg`); any frame the cockpit itself sent is **yellow** (`tx`). In the middle
   of a live flood you spot the moment you flipped a switch instantly.
-- **FREEZE.** Stops the live monitor so you can scroll back and click-copy a
-  frame; the button flips to `LIVE >>` to resume.
 
 ### Console / quick inject
-The **CAN INJECT** bar parses `cansend`-style `ID#DATA` lines (e.g.
-`400#FF3203FF`) and sends them onto the bus; press **Enter** in the box to
-send. Quick-inject buttons emit `DRIVE_IN` frames. Anything you inject shows up
-amber in the monitor and, in `--follower` mode, actually moves the car.
+To make a can injection, you can make the car do various things.The best way to do this to demonstrate a replay attack on the vehicle is to take the example of hitting the accelerator (the up arrow). You will see a yellow frame highlight. Then hit freeze on the can bus to stop the traffic and click the frame twice. Make sure it is a frame that starts with Tx, as these are frames that send can messages. It will populate that frame in the box after clicking twice. Once you have the frame in the box, hit enter. It will then accelerate the car and cause it to speed up. This can be done for all kinds of functions such as braking, turning the lights on, etc.
 
-The **0x120 STEER frame's lamp bits latch the switches** in *any* mode
-(headlights · wipers · hazard · highbeam · indicators), so the lights are
-a one-frame hack off the bus — steer byte0 itself still needs
-`--follower`:
-`120#0010…` headlights · `120#0020…` wipers · `120#0004…` hazard ·
-`120#0008…` highbeam · `120#0001…`/`120#0002…` left/right indicator ·
-`120#0000…` everything off (byte 1: `0x01` left · `0x02` right · `0x04`
-hazard · `0x08` highbeam · `0x10` headlights · `0x20` wipers).  Injected
-frames are one-shot; the switch stays latched until the next frame or a
-cockpit toggle.
+You can also hit record to capture an entire session. Can bus traffic will be recorded. Press Record -> perform actions on the vehicle ->  Stop -> Save -> Load - to upload the candump file -> Replay. This will cause all of the traffic that you have recorded to be replayed on the vehicle. This is a candump replay attack.
+
+Have fun playing with the car! This is how a real life attacker would compromise a vehicle if they are able to gain a foothold on the canbus. 
 
 ---
 
-## 5. Self-tests (headless, no display)
-
-```bash
-./run_tests.sh          # compile + selftest + --check + both e2e (fresh sim)
 ```
-
-or step by step:
-
-```bash
-python3 -m py_compile tools/carsim.py tools/carsim_gui.py
-python3 tools/carsim.py --selftest          # physics + OBD/UDS protocol
-python3 tools/carsim_gui.py --check         # GUI decode/inject helpers
-python3 tests/cockpit_e2e.py                # JSON end-to-end (needs sim running)
-python3 tests/ap_phase_e2e.py               # autopilot sequence (needs sim running)
-```
-
-Expected tails: `carsim selftest: ALL PASS`, `carsim_gui headless check: ALL
-PASS`, `E2E ALL PASS`, `ap phase-machine e2e: ALL PASS`.
 
 ---
-
-## 6. Running the engine on its own (optional)
-
-The cockpit normally brings the engine with it, but you can start the engine
-alone if you want to drive it over the control channel yourself:
-
-```bash
-./run_sim.sh --follower                     # engine, ctrl :20103
-```
-
-Engine CLI (`tools/carsim.py --help` for the rest):
-
-| Option | Meaning |
+| File | What it is |
 |---|---|
-| `--ctrl-port N` | JSON control port (default **20103**) |
-| `--follower` | ICSim-style drive: treat frames 0x100/0x110/0x120/0x140/0x400 as drive input |
-| `--no-traffic` | silent bench: no broadcast frames, only ECU replies |
-| `--ecus 1\|2\|3` | 1 = engine only, 2 = +TCM, 3 = +ABS (default 3) |
-| `--selftest` | headless physics/protocol assertions, then exit |
-| `--version` | print version and exit |
+| `tools/carsim.py` | Physics engine + ECU cluster (engine / TCM / ABS) + JSON control channel + loopback CAN INJECT + Sim-style `--follower` drive input |
+| `tools/carsim_gui.py` | tkinter cockpit: canvas road, 3×3 gauge cluster, lamps + live data, CAN console + quick inject, CAN BUS monitor, keyboard driving, cruise + 3-phase autopilot, body switches, faults, units |
+| `run_cockpit.sh` | Launcher for the cockpit — **the single entry point** (args pass through) |
+| `run_tests.sh` | Full headless verification (compile + selftest + `--check` + both e2e) |
+Requires **Python 3.10+** (tkinter for the GUI).
 
-`--help` / `--version` / `--selftest` always run through, and `./run_sim.sh` is
-idempotent — if a sim already listens on the control port it prints
-`carsim already listening on 127.0.0.1:20103 - nothing to start` and exits 0
-instead of crashing with `Address already in use`.
-
----
 
 MIT licensed.
