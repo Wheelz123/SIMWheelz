@@ -1,7 +1,7 @@
 # SimWheelz — drivable virtual CAN simulator + cockpit
 
 A virtual car that speaks **real OBD-II / UDS and CAN** over a loopback-only
-JSON control channel, with a drivable game cockpit on top. In this you can simulate what a real attacker who gains access to a can bus could do, reverse engineer can frames, and learn about vehicle vulnerabilities in a fun to play game interface.  No vehicle or CAN hardware is required: the whole bus — engine, TCM and ABS ECUs plus the classic broadcast frames — lives in `tools/carsim.py`, and `tools/carsim_gui.py` is the dashboard you drive it from.
+JSON control channel, with a drivable game cockpit on top. In this virtual environment, you can simulate what a real attacker who gains access to a can bus could do, reverse engineer can frames, and learn about vehicle vulnerabilities in a fun to play game interface.  No vehicle or CAN hardware is required: the whole bus — engine, TCM and ABS ECUs plus the classic broadcast frames — lives in `tools/carsim.py`, and `tools/carsim_gui.py` is the dashboard you drive it from.
 **One command starts the entire bench.** 
 ---
 
