@@ -17,7 +17,9 @@ frames as {"t":"frame","id":...} messages straight into
 CarSim.handle_rx_frame() -- the same path a SocketCAN/vcan0 wire used
 before the loopback-only refactor.  With the sim started --follower,
 injected 0x100/0x110/0x120/0x140/0x400 frames fold into the physics and
-the game reacts.
+the game reacts.  Injected 0x120 lamp bits and 0x130 body bits latch
+their switches in ANY mode -- the one-frame lamp/body hack
+(130#5000... pops the trunk with the belt still on).
   * LEFT  - scrolling road + car sprite (the "game view")
   * MID   - tiled 3x3 instrument cluster (small non-overlapping gauges) + odo
   * RIGHT - warning lamps, live-data table, CAN console + quick inject, controls
@@ -281,6 +283,10 @@ def inject_advisory(can_id):
                 "0x04, highbeam 0x08, left/right indicator 0x01/0x02; "
                 "120#0000... all off (steer byte0 itself still needs "
                 "--follower)")
+    if can_id == 0x130:                # body frame
+        return ("0x130 BODY byte0 latches the switches off the bus in any "
+                "mode: trunk 0x10, hood 0x20, belt 0x40, doors "
+                "0x01/0x02/0x04/0x08 (130#5000... pops the trunk, belt on)")
     if can_id in STATUS_IDS:
         return ("status frame (%s %s) - the sim publishes these itself, so "
                 "injecting one never commands the drivetrain; to drive, send "
@@ -1439,6 +1445,10 @@ class Cockpit:
                             "0x10, wipers 0x20, hazard 0x04, highbeam "
                             "0x08, indicators 0x01/0x02 latch the "
                             "switches in any mode" % hex(can_id))
+        elif can_id == 0x130:
+            self._inject_fb("ok", "%s BODY bits sent - byte0 trunk 0x10, "
+                            "hood 0x20, belt 0x40, doors 0x01-0x08 latch "
+                            "the switches in any mode" % hex(can_id))
         elif can_id in STATUS_IDS:
             self._inject_fb("note", "%s %s sent - it is an engine status "
                             "broadcast and cannot move the car (see Service "

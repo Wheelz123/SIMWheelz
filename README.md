@@ -73,6 +73,11 @@ Each toggle is passed to the sim, which broadcasts a **0x130 BODY** frame every
 Example: `door_fl` ON broadcasts `0x130 → 0100000000000000`; reset clears all
 body controls back to closed (belt stays on by default).
 
+Injected `0x130` frames work exactly like the `0x120` lamp hack: the byte-0
+bits latch the matching switches off the bus in **any** mode, so a single
+`130#1000...` pops the trunk (`130#5000...` pops it with the belt still on)
+and the sim re-broadcasts the state. Doors are bits `0x01`/`0x02`/`0x04`/`0x08`.
+
 ---
 
 ## 4. Reading the CAN BUS monitor

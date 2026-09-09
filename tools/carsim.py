@@ -30,7 +30,9 @@ exercised headlessly by --selftest.  With --follower, injected drive frames
 (0x100/0x110/0x120/0x140/0x400) are folded into the physics as remote
 input.  The 0x120 STEER lamp bits (headlights / highbeam / wipers / hazard /
 turn) latch the matching switches in ANY mode -- not just --follower --
-so the lamps can be hacked straight off the bus.
+so the lamps can be hacked straight off the bus.  The 0x130 BODY bits
+(doors / trunk / hood / belt) latch their switches the same way -- the
+classic one-frame body hack (130#1000... pops the trunk).
 
 Fault deck (toggles the same way the GUI shows them):
     mil      -> P0300  (MIL on, rpm jitter)
@@ -960,6 +962,24 @@ class CarSim:
                 self.switches[_n] = _on
                 ev.append(f"{_n} {'on' if _on else 'off'} via CAN INJECT")
 
+    # ------------------------------------------------------------- body latch
+    def _latch_body_bits(self, bits, ev):
+        """0x130 BODY byte0 -> switches: doors 0x01..0x08, trunk 0x10,
+        hood 0x20, seatbelt 0x40.  Runs in ANY mode (an injected frame
+        flips the switch; the sim's own broadcast then re-encodes it) --
+        the classic one-frame body hack."""
+        for _i, _n in enumerate(("door_fl", "door_fr", "door_rl",
+                                 "door_rr")):
+            _on = bool(bits & (1 << _i))
+            if self.switches.get(_n) != _on:
+                self.switches[_n] = _on
+                ev.append(f"{_n} {'on' if _on else 'off'} via CAN INJECT")
+        for _n, _b in (("trunk", 0x10), ("hood", 0x20), ("seatbelt", 0x40)):
+            _on = bool(bits & _b)
+            if self.switches.get(_n) != _on:
+                self.switches[_n] = _on
+                ev.append(f"{_n} {'on' if _on else 'off'} via CAN INJECT")
+
     # -------------------------------------------------------- drive follower
     def _apply_drive_frame(self, can_id, data):
         """ICSim-style: fold external drive frames into the physics.
@@ -1012,6 +1032,14 @@ class CarSim:
         if can_id == FRAME_STEER and len(data) >= 2:
             ev = []
             self._latch_lamp_bits(data[1], ev)
+            if ev:
+                with self._ev_lock:
+                    self.events.extend(ev)
+        # 0x130 BODY bits latch the switches in ANY mode too (doors, trunk,
+        # hood, belt) -- the same one-frame hack as the lamps.
+        if can_id == FRAME_BODY and data:
+            ev = []
+            self._latch_body_bits(data[0], ev)
             if ev:
                 with self._ev_lock:
                     self.events.extend(ev)

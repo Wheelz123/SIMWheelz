@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Headless verification: syntax, carsim selftest, GUI logic checks, and the
-# two e2e regressions against a fresh local sim (started and stopped here).
+# e2e regressions (drive, autopilot park-gate, CAN body inject) against a
+# fresh local sim on an isolated port (never collides with a live cockpit).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -20,14 +21,19 @@ python3 tools/carsim.py --selftest
 echo "== carsim_gui headless check =="
 python3 tools/carsim_gui.py --check
 
-echo "== starting fresh sim for e2e =="
-python3 tools/carsim.py --ctrl-port 20103 &
+# Isolated port so the suite never collides with a live cockpit on 20103.
+TEST_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+export CARSIM_PORT=$TEST_PORT
+echo "== starting fresh sim for e2e (port $TEST_PORT) =="
+python3 tools/carsim.py --ctrl-port "$TEST_PORT" &
 SIM_PID=$!
 sleep 1.2
 
 echo "== cockpit e2e =="
 python3 tests/cockpit_e2e.py
-echo "== autopilot phase e2e =="
+echo "== autopilot phase e2e (park gear gate) =="
 python3 tests/ap_phase_e2e.py
+echo "== CAN body inject (0x130 trunk/doors latch) =="
+python3 tests/body_inject_test.py
 
 echo "== ALL TESTS PASS =="
