@@ -2436,9 +2436,6 @@ def main():
                           f"127.0.0.1:{args.port} - see "
                           f"{_engine_log_path()}", file=sys.stderr)
                 return 1
-            else:
-                print(f"engine auto-started (ctrl 127.0.0.1:{args.port}); "
-                      f"log in {_engine_log_path()}")
         else:
             print(f"sim already listening on 127.0.0.1:{args.port} - "
                   "reusing it (engine not started)")
