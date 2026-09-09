@@ -60,7 +60,7 @@ except Exception:                       # non-GUI env / --check still works
     _HAS_TK = False
 
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -1009,11 +1009,26 @@ class Cockpit:
         cframe.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
         self.inject_var = tk.StringVar(value="cansend vcan0 400#FF00038000000000")
         row = ttk.Frame(cframe)
-        row.pack(fill="x", padx=4, pady=2)
-        ttk.Entry(row, textvariable=self.inject_var).pack(side="left",
-                                                          fill="x", expand=True)
-        ttk.Button(row, text="SEND", command=self._send_inject).pack(side="left",
-                                                                     padx=(4, 0))
+        row.pack(fill="x", padx=4, pady=(4, 2))
+        self.inject_entry = ttk.Entry(row, textvariable=self.inject_var)
+        self.inject_entry.pack(side="left", fill="x", expand=True)
+        self.inject_entry.bind("<Return>", self._send_inject)
+        self.inject_entry.bind("<KP_Enter>", self._send_inject)
+        self.inject_btn = ttk.Button(row, text="SEND",
+                                     command=self._send_inject)
+        self.inject_btn.pack(side="left", padx=(4, 0))
+        # Always-visible feedback line: Enter-key / SEND results at a glance.
+        try:
+            _fb_bg = ttk.Style().lookup("TLabelFrame", "background") or "#d9d9d9"
+        except Exception:
+            _fb_bg = "#d9d9d9"
+        self.inject_fb = tk.Label(
+            cframe, text="type ID#DATA (e.g. 110#4700000000000000) or "
+                         "cansend vcan0 ID#DATA, then press Enter or SEND",
+            bg=_fb_bg, fg="#5a6b78", font=("Consolas", 8), anchor="w",
+            justify="left", wraplength=0)
+        self.inject_fb.pack(fill="x", padx=6, pady=(0, 4))
+        self.inject_fb.bind("<Configure>", self._fb_fit)
         # ---------------- CAN BUS  (pane 1, widest; monitor + FREEZE)
         canbus = self._panel("pan", "CAN BUS", key="canbus", weight=2)
         canbus.columnconfigure(0, weight=1)
@@ -1345,16 +1360,67 @@ class Cockpit:
                  anchor="w").pack(fill="x")
 
     # ------------------------------------------------------------- controls
-    def _send_inject(self):
-        ok, msg = self.injector.send_cansend(self.inject_var.get())
-        self._log(("SENT " if ok else "FAIL ") + msg)
-        if ok:
-            parsed = parse_cansend(self.inject_var.get())
-            if parsed:
-                self._log_tx(parsed[0], parsed[1], src="console")
-                adv = inject_advisory(parsed[0])
-                if adv:
-                    self._log("note " + adv)
+    # Console-inject feedback colours (readable on the light ttk
+    # LabelFrame background of the CAN INJECT card).
+    INJ_COL = {"hint": "#5a6b78", "ok": "#1e7e34", "fail": "#c0392b",
+               "note": "#9a6b00"}
+
+    def _fb_fit(self, ev=None):
+        lb = getattr(self, "inject_fb", None)
+        if lb is None:
+            return
+        w = lb.winfo_width()
+        if w > 40 and int(lb.cget("wraplength") or 0) != w - 12:
+            lb.configure(wraplength=w - 12)
+
+    def _inject_fb(self, kind, text):
+        """Update the feedback line under the inject entry."""
+        if getattr(self, "inject_fb", None) is not None:
+            self.inject_fb.configure(text=text,
+                                     fg=self.INJ_COL.get(kind, "#5a6b78"))
+        if kind == "fail":
+            try:
+                self.root.bell()
+            except Exception:
+                pass
+
+    def _send_inject(self, _ev=None):
+        text = self.inject_var.get()
+        # Debounce keyboard auto-repeat from a held Enter key.
+        if (text == getattr(self, "_inj_last_txt", None)
+                and time.time() - getattr(self, "_inj_last_t", 0.0) < 0.35):
+            return
+        self._inj_last_txt = text
+        self._inj_last_t = time.time()
+        parsed = parse_cansend(text)
+        if parsed is None:
+            self._log("INJECT FAIL bad frame: " + text.strip())
+            self._inject_fb("fail", "bad frame - use e.g. "
+                            "cansend vcan0 400#FF00038000000000")
+            return
+        can_id, data = parsed
+        ok, msg = self.injector.send_cansend(text)
+        if not ok:
+            self._log("INJECT FAIL " + msg)
+            self._inject_fb("fail", msg + " - is the engine running?")
+            return
+        self._log_tx(can_id, data, src="console")
+        self._log("INJECT OK " + msg)
+        hexs = data.hex().upper()
+        adv = inject_advisory(can_id)
+        if adv:
+            self._log("INJECT NOTE " + adv)
+        if can_id == DRIVE_IN:
+            self._inject_fb("note", "0x400 DRIVE_IN sent - the engine "
+                            "applies it only while running as follower")
+        elif can_id in STATUS_IDS:
+            self._inject_fb("note", "%s %s sent - it is an engine status "
+                            "broadcast and cannot move the car (see Service "
+                            "log)" % (hex(can_id),
+                                      FRAME_NAMES.get(can_id, "")))
+        else:
+            self._inject_fb("ok", "sent %X#%s (%d bytes)"
+                            % (can_id, hexs, len(data)))
 
     def _bind_keys(self):
         self.root.bind("<KeyPress-Up>", lambda e: self._key_thr(1.0))
@@ -2139,6 +2205,12 @@ def _headless_check():
     checks.append(("parse 0x100 cansend", p2 is not None and p2[0] == 0x100))
     checks.append(("parse rejects junk", parse_cansend("hello world") is None))
     checks.append(("parse rejects >8", parse_cansend("400#112233445566778899") is None))
+    p3 = parse_cansend("110#4700000000000000")
+    checks.append(("parse 110#47.. bare", p3 is not None and p3[0] == 0x110
+                   and p3[1].hex() == "4700000000000000"))
+    p4 = parse_cansend("cansend vcan0 110#4700000000000000")
+    checks.append(("parse 110#47.. cansend", p4 is not None and p4[0] == 0x110
+                   and p4[1].hex() == "4700000000000000"))
 
     # ---- frame-semantics advisory (v0.6.2)
     checks.append(("advisory 0x400", "DRIVE_IN" in (inject_advisory(0x400) or "")))
