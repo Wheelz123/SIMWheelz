@@ -11,13 +11,13 @@ publishes everything over a JSON control channel (default 127.0.0.1:20103):
     RX {"t":"switch","name":"hazard","on":true}   {"t":"fault","name":"mil","on":true}
     RX {"t":"cruise","on":true}  {"t":"cruise","delta":5}   {"t":"reset"}
 
-The simulator's SLCAN-over-TCP server (default 127.0.0.1:20102) speaks
-standard Lawicel framing, so the CAN CONSOLE below sends real "cansend-style"
-frames straight into CarSim.handle_rx_frame() — the same path a SocketCAN/vcan0
-wire uses.  With the sim started --follower, injected 0x100/0x110/0x120/0x140/
-0x400 frames fold into the physics and the game reacts.
-
-Layout (three non-overlapping columns, per the approved mockup):
+The simulator is loopback-only: raw CAN frames are injected over the same
+JSON control channel, so the CAN CONSOLE below sends "cansend-style"
+frames as {"t":"frame","id":...} messages straight into
+CarSim.handle_rx_frame() -- the same path a SocketCAN/vcan0 wire used
+before the loopback-only refactor.  With the sim started --follower,
+injected 0x100/0x110/0x120/0x140/0x400 frames fold into the physics and
+the game reacts.
   * LEFT  - scrolling road + car sprite (the "game view")
   * MID   - tiled 3x3 instrument cluster (small non-overlapping gauges) + odo
   * RIGHT - warning lamps, live-data table, CAN console + quick inject, controls
@@ -35,7 +35,7 @@ sim is already listening on the ctrl port):
     python3 tools/carsim_gui.py
 
 Run as separate processes (advanced / remote engine):
-    python3 tools/carsim.py --follower &   # ECU side, ctrl :20103 / slcan :20102
+    python3 tools/carsim.py --follower &   # ECU side, ctrl :20103
     python3 tools/carsim_gui.py
 
 
@@ -71,7 +71,6 @@ __version__ = "0.9.8"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
-SL_PORT = 20102              # SLCAN-over-TCP (matches carsim SLCAN_PORT)
 KMH_TO_MPH = 0.6213712
 
 # --------------------------------------------------------------------------- #
@@ -353,12 +352,17 @@ def rec_to_cansend(items):
 
 
 class CanInjector:
-    """Thin SLCAN-over-TCP client: opens the sim's SLCAN port and sends 't' frames.
-    This is exactly what cansend does against a Lawicel SLCAN adapter."""
+    """Injects raw CAN frames over the sim's JSON control channel.
 
-    def __init__(self, host, port, on_log=None):
+    Loopback-only carsim has no SLCAN/CAN socket: a frame goes in as a
+    {"t":"frame","id":<can_id>,"data":"<hex>"} message on the ctrl
+    port -- exactly what the cockpit and external scripts send.  The sim
+    feeds it to CarSim.handle_rx_frame(), the same path a SocketCAN/vcan0
+    wire used before the loopback-only refactor."""
+
+    def __init__(self, host, ctrl_port, on_log=None):
         self.host = host
-        self.port = port
+        self.port = ctrl_port
         self.on_log = on_log
         self.status = "offline"
         self.sock = None
@@ -389,9 +393,8 @@ class CanInjector:
                 with self._lock:
                     self.sock = s
                 self.status = "online"
-                s.sendall(b"O\r")                    # open the SLCAN channel
                 if self.on_log:
-                    self.on_log(f"CAN injector online {self.host}:{self.port}")
+                    self.on_log(f"CAN injector online {self.host}:{self.port} (ctrl)")
             except OSError:
                 self.status = "offline"
                 with self._lock:
@@ -413,16 +416,16 @@ class CanInjector:
             self.status = "offline"
 
     def send_frame(self, can_id, data):
-        line = slcan_tx_line(can_id, data)
-        if line is None:
+        if not data:
             return False
+        msg = {"t": "frame", "id": can_id, "data": data.hex()}
         with self._lock:
             s = self.sock
         if s is None:
             self.status = "offline"
             return False
         try:
-            s.sendall((line + "\r").encode("ascii"))
+            s.sendall((json.dumps(msg) + "\n").encode("ascii"))
             return True
         except OSError:
             return False
@@ -604,13 +607,12 @@ def _draw_gauge(cv, cx, cy, r, value, vmax, label, color,
 #  The cockpit window
 # --------------------------------------------------------------------------- #
 class Cockpit:
-    def __init__(self, root, host, ctrl_port, slcan_port):
+    def __init__(self, root, host, ctrl_port):
         if not _HAS_TK:
             raise RuntimeError("tkinter not available")
         self.root = root
         self.host = host
         self.port = ctrl_port
-        self.sl_port = slcan_port
         self.units = "kmh"
         self.autopilot = False
         self.ap_target = 100.0
@@ -655,7 +657,7 @@ class Cockpit:
 
         self.client = CockpitClient(host, ctrl_port, on_state=self._on_state,
                                     on_log=self._log)
-        self.injector = CanInjector(host, slcan_port, on_log=self._log)
+        self.injector = CanInjector(host, ctrl_port, on_log=self._log)
 
         self.root.title("CAN FIRECOCKPIT - carsim")
         self.root.configure(bg="#0b0d10")
@@ -1711,7 +1713,7 @@ class Cockpit:
         st = self._state
         self.status_lbl.configure(
             text=f"status: {self.client.status}  ctrl:{self.host}:{self.port}"
-                 f"  bus:{self.injector.status} {self.host}:{self.sl_port}")
+                 f"  bus:{self.injector.status} via ctrl {self.host}:{self.port}")
         # Truthful START/RUNNING: _ign() sets the label optimistically, but
         # the sim may reject the crank (engine off while in D, etc.), so the
         # label is driven from state.engine_on every frame.
@@ -2288,7 +2290,7 @@ def _engine_log_path():
     return os.path.join(tempfile.gettempdir(), "carsim_engine.log")
 
 
-def _spawn_engine(ctrl_port, slcan_port):
+def _spawn_engine(ctrl_port):
     """Start the bundled carsim.py (--follower) bound to loopback.
 
     The engine's stdout/stderr are appended to _engine_log_path() so a
@@ -2307,8 +2309,6 @@ def _spawn_engine(ctrl_port, slcan_port):
     try:
         proc = subprocess.Popen(
             [sys.executable, "-u", engine,
-             "--host", "127.0.0.1",
-             "--slcan-port", str(slcan_port),
              "--ctrl-port", str(ctrl_port),
              "--follower"],
             stdin=subprocess.DEVNULL, stdout=log_fd,
@@ -2361,8 +2361,6 @@ def main():
                     help=f"carsim host (default {DEFAULT_HOST})")
     ap.add_argument("--port", type=int, default=CTRL_PORT,
                     help=f"JSON control port (default {CTRL_PORT})")
-    ap.add_argument("--slcan-port", type=int, default=SL_PORT,
-                    help=f"SLCAN injector port (default {SL_PORT})")
     ap.add_argument("--check", action="store_true",
                     help="run headless decode/inject checks and exit")
     args = ap.parse_args()
@@ -2381,7 +2379,7 @@ def main():
     atexit.register(_stop_engine)
     if _is_loopback_host(args.host):
         if not _port_open("127.0.0.1", args.port):
-            engine = _spawn_engine(args.port, args.slcan_port)
+            engine = _spawn_engine(args.port)
             if engine is None:
                 print("could not auto-start the engine; the cockpit will keep "
                       "retrying the connection", file=sys.stderr)
@@ -2397,9 +2395,8 @@ def main():
                           f"{_engine_log_path()}", file=sys.stderr)
                 return 1
             else:
-                print(f"engine auto-started (ctrl 127.0.0.1:{args.port}, "
-                      f"slcan :{args.slcan_port}); log in "
-                      f"{_engine_log_path()}")
+                print(f"engine auto-started (ctrl 127.0.0.1:{args.port}); "
+                      f"log in {_engine_log_path()}")
         else:
             print(f"sim already listening on 127.0.0.1:{args.port} - "
                   "reusing it (engine not started)")
@@ -2409,7 +2406,7 @@ def main():
     except Exception as exc:              # tk importable but no usable display
         print(f"cannot open the cockpit display: {exc}", file=sys.stderr)
         return 1
-    Cockpit(root, args.host, args.port, args.slcan_port)
+    Cockpit(root, args.host, args.port)
     root.mainloop()
     return 0
 

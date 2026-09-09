@@ -18,8 +18,7 @@ echo "== carsim_gui headless check =="
 python3 tools/carsim_gui.py --check
 
 echo "== starting fresh sim for e2e =="
-python3 tools/carsim.py --host 127.0.0.1 \
-    --slcan-port 20102 --ctrl-port 20103 &
+python3 tools/carsim.py --ctrl-port 20103 &
 SIM_PID=$!
 sleep 1.2
 

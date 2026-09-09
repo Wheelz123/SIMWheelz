@@ -6,44 +6,12 @@ What this is
 ------------
 A physics model of a 6-speed automatic car plus a *fake ECU cluster* that
 answers real OBD-II / UDS diagnostics, plus a *broadcast bus* with the classic
-CAN frames a real car puts on the wire (0x100 engine, 0x110 chassis,
+CAN frames a real car puts on the bus (0x100 engine, 0x110 chassis,
 0x120 steering/lights, 0x130 body, 0x140 gear/fuel).
 
-Three personalities, one binary:
-
-  1. TCP bench mode (default)
-       carsim.py
-     Listens on 127.0.0.1:20102 as a Lawicel SLCAN-over-TCP *server*:
-     S/O/C/V/N/F commands, "t" frames, V1013, N0000, F12.  The cockpit GUI
-     (carsim_gui.py) drives it over a second JSON control channel (port 20103).
-     Any standard SLCAN-over-TCP client can ping the ECUs, read DTCs/VIN, or
-     subscribe to live PIDs on this port.
-
-  2. SocketCAN / wired-bus mode
-       sudo ip link set can0 type can bitrate 500000 && sudo ip link set can0 up
-       carsim.py --iface can0
-     Binds can0 with raw SocketCAN, putting the ECU answers and the broadcast
-     frames on a real wired CAN bus so other bus participants (can-utils, a
-     physical SLCAN adapter, another host) can observe or drive the car.  The
-     TCP SLCAN server is OFF in this mode (--tcp-also to force it on).
-
-  3. --selftest
-       carsim.py --selftest
-     Headless physics + protocol assertions (no sockets, no CAN).  Used by the
-     build pipeline; the sandbox has no display, so this is how the engine is
-     verified before the GUI is ever opened.
-
-Lawicel SLCAN wire format:
-    RX to client :  t<3hex id><1hex dlc><2hex per byte>\r   (uppercase data)
-    TX from client: t<3hex id><1hex dlc><2hex per byte>\r   (T = extended id)
-    V -> "V1013\r", N -> "N0000\r", F -> "F12\r", O opens, C closes.
-    Frames are pushed only while a client is connected AND the channel is open.
-
-ISO-TP (ISO 15765-2) is handled ECU-side exactly like the reference ECU sim.py:
-    single-frame requests (PCI 1..7) -> immediate single-frame reply,
-    multi-frame replies (VIN, big DTC lists) -> FirstFrame, wait for the
-    client's FlowControl (0x30), then ConsecutiveFrames with 18 ms pacing.
-    If the *client* sends us a FirstFrame we answer FlowControl 30 00 00.
+This engine is loopback-only.  It no longer speaks SLCAN-over-TCP and it no
+longer opens a raw SocketCAN interface: the only socket is the JSON control
+channel, bound to 127.0.0.1:20103.
 
 JSON control channel (port 20103) — one 10 Hz state stream + commands:
     RX {"t":"input","throttle":0.0,"brake":0.0,"steer":0.0}
@@ -52,7 +20,14 @@ JSON control channel (port 20103) — one 10 Hz state stream + commands:
     RX {"t":"fault","name":"mil","on":true}
     RX {"t":"cruise","on":true}           RX {"t":"cruise","delta":5}
     RX {"t":"reset"}
+    RX {"t":"frame","id":256,"data":"...hex..."}   # CAN INJECT (id 0x100)
     TX {"t":"state", ...physics, lamps, faults, switches, frames, events}
+
+A diagnostic request frame injected with CAN INJECT is observed but never
+answered here — loopback has no reply channel.  The ISO-TP ECU side of the
+protocol (single/multi-frame replies, FlowControl pacing, DTCs, VIN) is
+exercised headlessly by --selftest.  With --follower, injected drive frames
+(0x100/0x110/0x120/0x140/0x400) are folded into the physics as remote input.
 
 Fault deck (toggles the same way the GUI shows them):
     mil      -> P0300  (MIL on, rpm jitter)
@@ -72,20 +47,19 @@ Run "carsim.py --help" for the full option list.
 import argparse
 import json
 import math
-import select
 import socket
 import struct
 import sys
 import threading
 import time
 
-__version__ = "0.3.3"
+__version__ = "0.4.0"
 
 # --------------------------------------------------------------------------- #
 #  Constants
 # --------------------------------------------------------------------------- #
 
-SLCAN_PORT = 20102            # Lawicel SLCAN-over-TCP server
+CTRL_PORT = 20103             # loopback JSON control channel (cockpit GUI)
 CTRL_PORT = 20103             # JSON control channel for the cockpit GUI
 
 ECU_ENGINE = 0x7E8            # engine  -> answers functional 0x7DF + phys 0x7E0
@@ -124,8 +98,8 @@ FRAME_STEER = 0x120           # 50 ms : steer + light/wiper bits
 FRAME_BODY = 0x130            # 50 ms : doors/trunk/hood/seatbelt bits
 FRAME_GEAR = 0x140            # 100 ms: gear enum fuel% odo(u32 LE) runtime(u16 LE)
 
-# External drive-input frame (ICSim-style): a control sender (cangen/cansend or
-# the cockpit) drives the car.  bytes: throttle*255, brake*100, gear_enum, steer_byte, ..
+# External drive-input frame (ICSim-style): a CAN INJECT sender (the cockpit
+# GUI or a script) drives the car.  bytes: throttle*255, brake*100, gear_enum, steer_byte, ..
 # steer_byte: 0..255 with 128 = centered, so (b-128)/127 gives -1..1.
 FRAME_DRIVE_IN = 0x400
 DRIVE_IDS = (FRAME_ENGINE, FRAME_CHASSIS, FRAME_STEER, FRAME_GEAR, FRAME_DRIVE_IN)
@@ -762,135 +736,6 @@ def handle_request(req_id, payload, p, faults, ecus_enabled):
 
 
 # --------------------------------------------------------------------------- #
-#  SLCAN-over-TCP server (Lawicel framing)
-# --------------------------------------------------------------------------- #
-
-class SlcanClient:
-    def __init__(self, sock, addr, sim):
-        self.sock = sock
-        self.addr = addr
-        self.sim = sim
-        self.lock = threading.Lock()
-        self.open = False
-        self.pending_mf = None           # (rest_bytes, seq) waiting for FC
-        self._buf = b""
-
-    def send_frame(self, can_id, data):
-        """Push one frame as an SLCAN line (only when channel open)."""
-        if not self.open:
-            return
-        dlc = len(data)
-        line = f"t{can_id:03X}{dlc:1X}{data.hex().upper()}\r".encode("ascii")
-        try:
-            with self.lock:
-                self.sock.sendall(line)
-        except OSError:
-            self.sim.drop_client(self)
-
-    def run(self):
-        try:
-            while True:
-                try:
-                    chunk = self.sock.recv(1024)
-                except socket.timeout:
-                    continue        # idle client: keep the link open
-                if not chunk:
-                    break
-                self._buf += chunk
-                while (b"\r" in self._buf) or (b"\n" in self._buf):
-                    # split on whichever terminator comes first (CR or LF)
-                    i = self._buf.find(b"\r")
-                    j = self._buf.find(b"\n")
-                    if i == -1:
-                        i = j
-                    elif j != -1 and j < i:
-                        i = j
-                    line, self._buf = self._buf[:i], self._buf[i + 1:]
-                    line = line.strip().decode("ascii", "replace")
-                    if line:
-                        self._cmd(line)
-        except OSError:
-            pass
-        finally:
-            self.sim.drop_client(self)
-    def _cmd(self, line):
-        c = line[0].upper() if line else ""
-        if c == "S":                     # bitrate (Lawicel codes, logged only)
-            return
-        if c == "O":
-            self.open = True
-            return
-        if c == "C":
-            self.open = False
-            self.pending_mf = None
-            return
-        if c == "V":
-            self._reply(b"V1013\r")
-            return
-        if c == "N":
-            self._reply(b"N0000\r")
-            return
-        if c == "F":
-            self._reply(b"F12\r")
-            return
-        if c in ("t", "T", "r", "R"):
-            if c in ("r", "R"):
-                return
-            frm = self._parse_tx(line)
-            if frm is None or not self.open:
-                return
-            can_id, data = frm
-            self.sim.handle_rx_frame(self, can_id, data)
-
-    def _reply(self, raw):
-        try:
-            with self.lock:
-                self.sock.sendall(raw)
-        except OSError:
-            self.sim.drop_client(self)
-
-    @staticmethod
-    def _parse_tx(line):
-        ext = line[0] == "T"
-        n_id = 8 if ext else 3
-        try:
-            can_id = int(line[1:1 + n_id], 16)
-            dlc = int(line[1 + n_id:2 + n_id], 16)
-            if dlc > 8 or len(line) < 2 + n_id + dlc * 2:
-                return None
-            data = bytes.fromhex(line[2 + n_id:2 + n_id + dlc * 2])
-        except ValueError:
-            return None
-        return can_id, data
-
-
-class SlcanServer:
-    def __init__(self, sim, host, port):
-        self.sim = sim
-        self.host = host
-        self.port = port
-        self.sock = None
-
-    def start(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((self.host, self.port))
-        self.sock.listen(5)
-        threading.Thread(target=self._accept, daemon=True).start()
-
-    def _accept(self):
-        while True:
-            try:
-                conn, addr = self.sock.accept()
-            except OSError:
-                return
-            conn.settimeout(0.5)
-            client = SlcanClient(conn, addr, self.sim)
-            self.sim.add_client(client)
-            threading.Thread(target=client.run, daemon=True).start()
-
-
-# --------------------------------------------------------------------------- #
 #  JSON control channel (cockpit GUI)
 # --------------------------------------------------------------------------- #
 
@@ -965,65 +810,15 @@ class CtrlServer:
 
 
 # --------------------------------------------------------------------------- #
-#  AF_CAN (SocketCAN) wired-bus mode
-# --------------------------------------------------------------------------- #
-
-class CanWire:
-    """Raw SocketCAN tap: same pattern as the reference ECU sim.py (AF_CAN / CAN_RAW)."""
-
-    def __init__(self, iface):
-        self.iface = iface
-        self.sock = None
-
-    def open(self):
-        try:
-            import socket as _s
-            s = _s.socket(_s.AF_CAN, _s.SOCK_RAW, _s.CAN_RAW)
-            s.bind((self.iface,))
-        except OSError as e:
-            sys.exit(f"cannot open {self.iface}: {e}\n"
-                     "  sudo ip link set can0 type can bitrate 500000\n"
-                     "  sudo ip link set can0 up")
-        # loopback OFF: we must not re-read our own broadcasts / diagnostic replies
-        try:
-            s.setsockopt(_s.SOL_CAN_RAW, _s.CAN_RAW_LOOPBACK, 0)
-        except (OSError, AttributeError):
-            pass
-        self.sock = s
-
-    def send(self, can_id, data):
-        if len(data) < 8:
-            data += b"\x00" * (8 - len(data))
-        try:
-            self.sock.send(struct.pack("<IB3x8s", can_id, 8, data))
-        except OSError:
-            pass                     # TX queue full: drop (bus is busy)
-
-    def recv(self, timeout):
-        r, _, _ = select.select([self.sock], [], [], timeout)
-        if not r:
-            return None
-        raw = self.sock.recv(16)
-        can_id, dlc = struct.unpack("<IB3x8s", raw)[0], struct.unpack(
-            "<IB3x8s", raw)[1] & 0x0F
-        data = raw[8:8 + dlc]
-        return can_id & 0x1FFFFFFF, data
-
-
-# --------------------------------------------------------------------------- #
 #  The simulation core
 # --------------------------------------------------------------------------- #
 
 class CarSim:
-    """Owns the physics, the ECUs, the clients and the 20 ms tick loop."""
+    """Owns the physics, the ECUs and the 20 ms tick loop (loopback only)."""
 
-    def __init__(self, host="", slcan_port=SLCAN_PORT, ctrl_port=CTRL_PORT,
-                 iface=None, tcp_also=False, no_traffic=False, ecus=3,
+    def __init__(self, ctrl_port=CTRL_PORT, no_traffic=False, ecus=3,
                  speed=1.0, follower=False):
-        self.host = host
-        self.slcan_port = slcan_port
         self.ctrl_port = ctrl_port
-        self.iface = iface
         self.no_traffic = no_traffic
         self.ecus = ecus
         self.speed = speed
@@ -1043,10 +838,7 @@ class CarSim:
                        "abs": False, "flat": False}
         self.events = []
         self._ev_lock = threading.Lock()
-        self._clients = {}
-        self._cl_lock = threading.Lock()
-        self.ctrl = CtrlServer(self, host, ctrl_port)
-        self.wire = CanWire(iface) if iface else None
+        self.ctrl = CtrlServer(self, "127.0.0.1", ctrl_port)
         self._frames = {}                # id -> (period, next_time)
         self._frame_builders = {
             FRAME_ENGINE: (0.020, lambda: frame_engine(self.phys)),
@@ -1058,33 +850,13 @@ class CarSim:
         }
         for fid, (period, _b) in self._frame_builders.items():
             self._frames[fid] = (period, 0.0)
-        self._parkbrake_ref = None
         self._last_chime = 0.0
         self._last_lowfuel = 0.0
         self._last_door = 0.0
         self._last_pb = 0.0
         self._stop = False
         self._last_frames = []
-        self._sent_frames = {}             # id -> last broadcast bytes (TCP)
-        self.wire_pending_mf = None        # (rest, seq, ecu_id) in wire mode
-
-    # ---------------------------------------------------------- client mgmt
-    def add_client(self, client):
-        with self._cl_lock:
-            self._clients[client] = client
-
-    def drop_client(self, client):
-        with self._cl_lock:
-            if client in self._clients:
-                del self._clients[client]
-        try:
-            client.sock.close()
-        except OSError:
-            pass
-
-    def _opened_clients(self):
-        with self._cl_lock:
-            return [c for c in self._clients if c.open]
+        self._sent_frames = {}             # id -> last broadcast bytes (snapshot)
 
     def _blink(self):
         return 1 if int(self.phys.t / 0.333) % 2 == 0 else 0
@@ -1151,6 +923,22 @@ class CarSim:
             for k in self.faults:
                 self.faults[k] = False
             ev.append("sim reset")
+        elif t == "frame":
+            # CAN INJECT: raw loopback frame from the cockpit GUI or a script,
+            # fed straight to handle_rx_frame.  Loopback has no reply channel,
+            # so a diagnostic request frame is observed but never answered
+            # here; the ISO-TP ECU side is exercised by --selftest.
+            try:
+                raw_id = msg.get("id", 0)
+                can_id = int(raw_id) if not isinstance(raw_id, str) \
+                    else int(raw_id, 0)
+                data = bytes.fromhex(str(msg.get("data", "")))
+            except (KeyError, ValueError, TypeError):
+                return
+            if not data or len(data) > 8:
+                return
+            self.handle_rx_frame(can_id, data)
+            return
         if ev:
             with self._ev_lock:
                 self.events.extend(ev)
@@ -1190,43 +978,10 @@ class CarSim:
             with self._ev_lock:
                 self.events.extend(ev)
 
-    def _wire_loop(self, timeout=0.05):
-        """Read frames off the CAN wire (diagnostics + follower injection)."""
-        while not self._stop:
-            try:
-                got = self.wire.recv(timeout)
-            except OSError:
-                break
-            if got is None:
-                continue
-            can_id, data = got
-            self.handle_rx_frame(None, can_id, data)
-
-    # -------------------------------------------------------- incoming frames
-    def handle_rx_frame(self, client, can_id, data):
-        """A raw CAN frame arrived from a client (or the CAN wire)."""
+    # ---------------------------------------------------- incoming frames (loopback)
+    def handle_rx_frame(self, can_id, data):
+        """A raw CAN frame arrived via CAN INJECT on the JSON control channel."""
         if not data:
-            return
-        pci = data[0]
-        if pci & 0xF0 == 0x30:                 # FlowControl for our MF reply
-            if client is not None and client.pending_mf:
-                rest, seq, ecu_id = client.pending_mf
-                client.pending_mf = None
-                for i in range(0, len(rest), 7):
-                    chunk = rest[i:i + 7]
-                    chunk += b"\x00" * (8 - len(chunk))
-                    client.send_frame(ecu_id, bytes([0x20 | (seq & 0x0F)]) + chunk)
-                    seq = (seq + 1) & 0x0F
-                    time.sleep(0.018)
-            elif self.wire_pending_mf:
-                rest, seq, ecu_id = self.wire_pending_mf
-                self.wire_pending_mf = None
-                for i in range(0, len(rest), 7):
-                    chunk = rest[i:i + 7]
-                    chunk += b"\x00" * (8 - len(chunk))
-                    self.wire.send(ecu_id, bytes([0x20 | (seq & 0x0F)]) + chunk)
-                    seq = (seq + 1) & 0x0F
-                    time.sleep(0.018)
             return
         # ICSim-style: external drive frames fold straight into the physics
         if self.follower and can_id in DRIVE_IDS:
@@ -1235,47 +990,10 @@ class CarSim:
         ecu_id, ecu = ecu_for_req(can_id)
         if ecu_id is None:
             return
-        items = handle_request(can_id, data, self.phys, self.faults, self.ecus)
-        # In wire mode the ECU answers go out on the CAN bus (real proof).
-        if self.wire is not None:
-            for kind, rid, body in items:
-                if kind == "fc":        # FlowControl: raw 8-byte frame
-                    frm = body + b"\x00" * (8 - len(body))
-                    self.wire.send(rid, frm)
-                elif kind == "sf":
-                    frm = bytes([len(body)]) + body
-                    frm += b"\x00" * (8 - len(frm))
-                    self.wire.send(rid, frm)
-                else:
-                    total = len(body)
-                    ff = bytes([0x10 | ((total >> 8) & 0x0F), total & 0xFF]) \
-                        + body[:6]
-                    ff += b"\x00" * (8 - len(ff))
-                    self.wire.send(rid, ff)
-                    rest = body[6:]
-                    if client is not None:
-                        client.pending_mf = (rest, 1, rid)
-                    else:
-                        self.wire_pending_mf = (rest, 1, rid)
-            return
-        if client is None:
-            return
-        for kind, rid, body in items:
-            if kind == "fc":            # FlowControl: raw 8-byte frame
-                frm = body + b"\x00" * (8 - len(body))
-                client.send_frame(rid, frm)
-            elif kind == "sf":
-                frm = bytes([len(body)]) + body
-                frm += b"\x00" * (8 - len(frm))
-                client.send_frame(rid, frm)
-            else:
-                total = len(body)
-                ff = bytes([0x10 | ((total >> 8) & 0x0F), total & 0xFF]) \
-                    + body[:6]
-                ff += b"\x00" * (8 - len(ff))
-                client.send_frame(rid, ff)
-                client.pending_mf = (body[6:], 1, rid)
-
+        # Loopback has no reply channel: run the ECU request so its side
+        # effects (DTC clearing, fault bookkeeping) still happen; the reply
+        # frames are dropped here.  The ISO-TP reply path is --selftest.
+        handle_request(can_id, data, self.phys, self.faults, self.ecus)
     # ------------------------------------------------------------- main tick
     def tick(self, dt):
         ev = []
@@ -1305,27 +1023,15 @@ class CarSim:
 
         # broadcast frames
         if not self.no_traffic:
-            out = []
             for fid, (period, next_t) in self._frames.items():
                 if mono >= next_t:
                     self._frames[fid] = (period, mono + period)
-                    data = self._frame_builders[fid][1]()
-                    if self.wire is not None:
-                        self.wire.send(fid, data)
-                    else:
-                        # TCP bench: always hand the cockpit a FULL per-ID
-                        # snapshot so every gauge/bus row updates every tick
-                        self._sent_frames[fid] = data
-                        out.append({"id": fid, "dlc": len(data),
-                                    "data": data.hex().upper()})
-                        for c in self._opened_clients():
-                            c.send_frame(fid, data)
-            if self.wire is not None:
-                self._last_frames = out
-            else:
-                self._last_frames = [
-                    {"id": fid, "dlc": len(d), "data": d.hex().upper()}
-                    for fid, d in sorted(self._sent_frames.items())]
+                    self._sent_frames[fid] = self._frame_builders[fid][1]()
+            # always hand the cockpit a FULL per-ID snapshot so every
+            # gauge/bus row updates every tick
+            self._last_frames = [
+                {"id": fid, "dlc": len(d), "data": d.hex().upper()}
+                for fid, d in sorted(self._sent_frames.items())]
 
         # 10 Hz state stream to the cockpit
         if int(now * 10.0) != getattr(self, "_last_state_tick", -1):
@@ -1348,7 +1054,7 @@ class CarSim:
                         for h, l, _s in engine_dtcs(self.faults)]
         state["dtc_abs"] = [f"{'PCBU'[(h >> 6) & 3]}{((h << 8) | l) & 0x3FFF:04X}"
                             for h, l, _s in abs_dtcs(self.faults)]
-        state["mode"] = "can-wire" if self.wire else "tcp-bench"
+        state["mode"] = "bench"
         state["source"] = ("remote CAN inject" if self.remote_drive
                           else "keyboard")
         self.ctrl.push(state)
@@ -1356,26 +1062,16 @@ class CarSim:
     # -------------------------------------------------------------- main loop
     def run(self):
         self.ctrl.start()
-        if self.wire is not None:
-            self.wire.open()
-            # always read the wire: diagnostics need a request read; follower
-            # additionally folds external drive frames into the physics.
-            threading.Thread(target=self._wire_loop, args=(0.05,), daemon=True).start()
-            print(f"carsim {__version__} on CAN wire {self.iface}")
-            print("  ECUs: engine 7E8, TCM 7E9, ABS 7EA on the CAN bus")
-            print("  broadcast: 0x100/0x110/0x120/0x130/0x140")
-            if self.follower:
-                print("  follower drive: ON  (reads 0x100/0x110/0x120/0x140/0x400 as"
-                      " remote input; send with cangen/cansend)")
-            print("  control channel on %s:%d (cockpit GUI drives here)"
-                  % (self.host or "0.0.0.0", self.ctrl_port))
-            print("  TCP SLCAN server:", "ON" if self._slcan else "OFF (--tcp-also)")
-        else:
-            print(f"carsim {__version__} - SLCAN server on {self.host or '0.0.0.0'}:{self.slcan_port}")
-            print(f"  JSON control channel on {self.host or '0.0.0.0'}:{self.ctrl_port}")
-            print("  SLCAN-over-TCP: nc %s %d   (Lawicel V/N/F/t framing)"
-                  % (self.host or "127.0.0.1", self.slcan_port))
-        print("  Ctrl-C to stop\n")
+        print(f"carsim {__version__} - loopback engine (JSON control channel only)")
+        print(f"  JSON control channel on 127.0.0.1:{self.ctrl_port}")
+        print("    commands: input / gear / ignition / switch / fault / cruise / reset")
+        print('    CAN INJECT: {"t":"frame","id":256,"data":"0100"}')
+        print("  ECUs: engine 7E8, TCM 7E9, ABS 7EA (ISO-TP; exercised by --selftest)")
+        print("  broadcast: 0x100/0x110/0x120/0x130/0x140")
+        if self.follower:
+            print("  follower drive: ON  (CAN INJECT 0x100/0x110/0x120/0x140/0x400")
+            print("                 folded in as remote input)")
+        print("  Ctrl-C to stop")
 
         base_dt = 0.02
         next_t = time.monotonic()
@@ -1583,25 +1279,17 @@ def selftest():
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Drivable virtual car: physics + OBD/UDS ECU cluster "
-                    "+ SLCAN-over-TCP server + SocketCAN wired-bus mode.")
-    ap.add_argument("--host", default="", help="bind address (default all)")
-    ap.add_argument("--slcan-port", type=int, default=SLCAN_PORT,
-                    help="SLCAN-over-TCP port (default 20102)")
+        description="Loopback-only virtual car: physics + OBD/UDS ECU cluster "
+                    "served over one JSON control channel.")
     ap.add_argument("--ctrl-port", type=int, default=CTRL_PORT,
                     help="JSON control port (default 20103)")
-    ap.add_argument("--iface", default=None, metavar="CAN0",
-                    help="SocketCAN interface; puts ECUs + broadcasts on the "
-                         "WIRE and disables the TCP SLCAN server")
-    ap.add_argument("--tcp-also", action="store_true",
-                    help="keep the TCP SLCAN server in --iface mode")
     ap.add_argument("--no-traffic", action="store_true",
                     help="silent bench: no broadcast frames, only ECU replies")
     ap.add_argument("--ecus", type=int, default=3, choices=[1, 2, 3],
                     help="1=engine, 2=+TCM, 3=+ABS (default 3)")
     ap.add_argument("--follower", action="store_true",
-                    help="ICSim-style drive: accept 0x100/0x110/0x120/0x140/0x400 "
-                         "as remote drive input from the bus")
+                    help="ICSim-style drive: fold CAN INJECT 0x100/0x110/0x120/"
+                         "0x140/0x400 into the physics as remote input")
     ap.add_argument("--selftest", action="store_true",
                     help="run headless physics/protocol assertions and exit")
     ap.add_argument("--version", action="version",
@@ -1611,18 +1299,10 @@ def main():
     if args.selftest:
         return selftest()
 
-    sim = CarSim(host=args.host, slcan_port=args.slcan_port,
-                 ctrl_port=args.ctrl_port, iface=args.iface,
-                 tcp_also=args.tcp_also, no_traffic=args.no_traffic,
+    sim = CarSim(ctrl_port=args.ctrl_port, no_traffic=args.no_traffic,
                  ecus=args.ecus, follower=args.follower)
-    if args.iface and not args.tcp_also:
-        sim._slcan = False
-    else:
-        sim._slcan = True
-        server = SlcanServer(sim, args.host, args.slcan_port)
-        server.start()
-        sim._slcan_server = server
     sim.run()
+    return 0
 
 
 if __name__ == "__main__":

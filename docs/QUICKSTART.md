@@ -28,7 +28,7 @@ cockpit **auto-starts the bundled engine** as `--follower` (so injected frames
 actually drive the car) and prints:
 
 ```
-engine auto-started (ctrl 127.0.0.1:20103, slcan :20102); log in /tmp/carsim_engine.log
+engine auto-started (ctrl 127.0.0.1:20103); log in /tmp/carsim_engine.log
 ```
 
 If a sim is already running, it is left completely untouched:
@@ -163,6 +163,6 @@ to the clipboard; double-click loads it into the inject box.
   `./run_sim.sh` prints `nothing to start` and exits 0 when a sim is already
   up, instead of crashing with `Address already in use`. `./run_tests.sh` starts
   its own fresh sim on a quiet port, so it can always test.
-- **A single 0-frame SLCAN readout right after another test completes** is a
+- **A single 0-frame readout right after another test completes** is a
   known connect-race transient; an immediate re-probe streams frames again.
   Not a regression.

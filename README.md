@@ -1,6 +1,7 @@
 # CarSimWheelz — drivable virtual CAN simulator + cockpit
 
-A virtual car that speaks **real OBD-II / UDS and CAN over SLCAN**, with a
+A virtual car that speaks **real OBD-II / UDS and CAN** over a loopback-only
+JSON control channel, with a
 drivable game cockpit on top. No vehicle or CAN hardware is required: the whole
 bus — engine, TCM and ABS ECUs plus the classic broadcast frames — lives in
 `tools/carsim.py`, and `tools/carsim_gui.py` is the dashboard you drive it from.
@@ -10,7 +11,7 @@ setup.
 
 | File | What it is |
 |---|---|
-| `tools/carsim.py` | Physics engine + ECU cluster (engine / TCM / ABS) + SLCAN server + JSON control channel + ICSim-style `--follower` drive input |
+| `tools/carsim.py` | Physics engine + ECU cluster (engine / TCM / ABS) + JSON control channel + loopback CAN INJECT + ICSim-style `--follower` drive input |
 | `tools/carsim_gui.py` | tkinter cockpit: canvas road, 3×3 gauge cluster, lamps + live data, CAN console + quick inject, CAN BUS monitor, keyboard driving, cruise + 3-phase autopilot, body switches, faults, units |
 | `run_cockpit.sh` | Launcher for the cockpit — **the single entry point** (args pass through) |
 | `run_tests.sh` | Full headless verification (compile + selftest + `--check` + both e2e) |
@@ -30,7 +31,7 @@ the cockpit **auto-starts the bundled engine** as `--follower` (so injected
 frames actually drive the car) and prints:
 
 ```
-engine auto-started (ctrl 127.0.0.1:20103, slcan :20102); log in /tmp/carsim_engine.log
+engine auto-started (ctrl 127.0.0.1:20103); log in /tmp/carsim_engine.log
 ```
 
 If a sim is already running, it is left completely untouched:
@@ -177,14 +178,13 @@ The cockpit normally brings the engine with it, but you can start the engine
 alone if you want to drive it over the control channel yourself:
 
 ```bash
-./run_sim.sh --follower                     # engine, ctrl :20103 / slcan :20102
+./run_sim.sh --follower                     # engine, ctrl :20103
 ```
 
 Engine CLI (`tools/carsim.py --help` for the rest):
 
 | Option | Meaning |
 |---|---|
-| `--slcan-port N` | SLCAN port (default **20102**) |
 | `--ctrl-port N` | JSON control port (default **20103**) |
 | `--follower` | ICSim-style drive: treat frames 0x100/0x110/0x120/0x140/0x400 as drive input |
 | `--no-traffic` | silent bench: no broadcast frames, only ECU replies |
