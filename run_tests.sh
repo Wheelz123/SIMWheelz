@@ -11,6 +11,9 @@ trap cleanup EXIT
 echo "== compile =="
 python3 -m py_compile tools/carsim.py tools/carsim_gui.py
 
+echo "== renderer gate (park lane-drift) =="
+python3 tests/renderer_gate_test.py
+
 echo "== carsim selftest =="
 python3 tools/carsim.py --selftest
 

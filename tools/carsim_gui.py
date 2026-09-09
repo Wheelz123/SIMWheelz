@@ -722,7 +722,9 @@ class Cockpit:
             return ("ENGINE OFF gear %s | shift to P or N, then i / START"
                     % gear)
         if gear == "P":
-            return "park: %s only revs the engine - press D to drive" % "↑"
+            return ("You must start the car in park by hitting the I (ignition) "
+                    "key. Then you must shift the car into drive by hitting "
+                    "the D key.")
         if gear == "N":
             return "neutral: no drive - press D"
         if gear == "R":
@@ -1692,6 +1694,18 @@ class Cockpit:
             self._ap_phase = 1
             self._log("engine stalled - restarting")
             return
+        # park/neutral/reverse safety gate: phase-3 speed-hold is a driving
+        # assist that only applies in Drive.  Shifting out of D (P/N/R)
+        # while it is running stops the sway/steer broadcast immediately and
+        # hands back manual control (mirrors the cruise-control gear check).
+        if gear != "D":
+            self.autopilot = False
+            self._ap_phase = 0
+            self.ap_btn.configure(text="AUTOPILOT ON" if self.autopilot else "OFF")
+            self.client.send({"t": "input", "throttle": 0.0, "brake": 0.0,
+                              "steer": 0.0})
+            self._log("autopilot OFF - gear %s (manual control)" % gear)
+            return
         target = self.ap_target
         err = target - speed
         thr = 0.0 if err < 0 else min(0.85, 0.03 + err * 0.012)
@@ -1991,8 +2005,12 @@ class Cockpit:
         # road stays fixed; the CAR moves laterally within it.  Steering is
         # INTEGRATED, so the car changes lane while the key is held and HOLDS
         # its lane when the key is released (no auto-recenter to the middle).
-        self._car_lat += steer * getattr(self, "_lat_rate", 12.0)
-        self._car_lat = max(-90.0, min(90.0, self._car_lat))
+        # Lane drift only applies while the car is actually moving: in Park
+        # (or any standstill) the front wheels may still be steered, but the
+        # car body cannot change lanes.
+        if speed_kmh > 1.0:
+            self._car_lat += steer * getattr(self, "_lat_rate", 12.0)
+            self._car_lat = max(-90.0, min(90.0, self._car_lat))
         road_center = w / 2.0
         road_w = 300.0
         cv.create_rectangle(road_center - road_w / 2, 0, road_center + road_w / 2,

@@ -7,6 +7,7 @@ Mirrors Cockpit._ap_toggle / _autopilot exactly:
   phase 1: gear P/N -> ignition ON, wait  -> phase 2
   phase 2: engine_on -> gear D            -> phase 3
   phase 3: 10 Hz P-controller speed hold + steer sway
+  phase 3 gear gate: gear != D -> phase 0 + zeroed inputs (park sway fix)
   toggle OFF: zero inputs                 -> phase 0
 """
 import json
@@ -102,6 +103,12 @@ def gui_autopilot(sim, phase, engine, gear, speed):
     # phase 3
     if not engine:
         return 1
+    if gear != "D":
+        # park/neutral/reverse safety gate: speed-hold sway is only valid in
+        # Drive; shifting out of D must stop the sway/steer broadcast and
+        # return to manual control (phase 0) with zeroed inputs.
+        sim.send({"t": "input", "throttle": 0.0, "brake": 0.0, "steer": 0.0})
+        return 0
     err = TARGET - speed
     thr = 0.0 if err < 0 else min(0.85, 0.03 + err * 0.012)
     brk = min(1.0, max(0.0, (speed - TARGET) * 0.06)) if speed > TARGET + 2 else 0.0
@@ -201,6 +208,30 @@ def main():
         print(f"        note: brake window expired at "
               f"{sim.state.get('speed'):.1f} km/h (decel already shown)")
     sim.send({"t": "input", "throttle": 0.0, "brake": 0.0, "steer": 0.0})
+
+    # --- regression: park gear gate stops phase-3 sway -------------------
+    # Engine running, stopped in D.  Replay phase-3 sway (as if autopilot
+    # had been left ON while the driver braked to a stop), then shift to P:
+    # the gear gate must disengage (phase 0) and zero steer/throttle/brake.
+    # Before the fix, the +/-0.14 steer sway kept broadcasting at 10 Hz and
+    # the parked car wove across the road.
+    sim.send({"t": "input", "throttle": 0.85, "brake": 0.0, "steer": 0.14})
+    sim.send({"t": "gear", "gear": "P"})
+    ok_p = sim.wait(lambda m: m.get("gear") == "P",
+                    "park regression: P shift accepted (stopped)")
+    ph = gui_autopilot(sim, 3, sim.state.get("engine_on", False), "P",
+                       abs(sim.state.get("speed", 0.0)))
+    if ph == 0:
+        print("  [OK] park regression: gear gate -> phase 0 (disengaged)")
+    else:
+        print(f"  [FAIL] park regression: gear gate -> phase 0 (got {ph})")
+        fail.append("park gear gate disengage")
+    ok_z = sim.wait(lambda m: (abs(m.get("steer", 9.0)) < 0.001 and
+                               abs(m.get("throttle", 9.0)) < 0.001 and
+                               abs(m.get("brake", 9.0)) < 0.001),
+                    "park regression: steer/throttle/brake zeroed", 3.0)
+    if not (ok_p and ph == 0 and ok_z):
+        fail.append("park sway regression")
 
     sim.s.close()
     if fail:
