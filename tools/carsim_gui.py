@@ -30,7 +30,11 @@ Layout (three non-overlapping columns, per the approved mockup):
     RX-changed-only) to a text dump; SAVE writes it; LOAD reads a dump back
     and REPLAY re-injects it at the original timing into whichever CAN
     output the cockpit is wired to (a second sim).
-Run against a local bench sim:
+Run (single entry - the cockpit auto-starts the engine on loopback when no
+sim is already listening on the ctrl port):
+    python3 tools/carsim_gui.py
+
+Run as separate processes (advanced / remote engine):
     python3 tools/carsim.py --follower &   # ECU side, ctrl :20103 / slcan :20102
     python3 tools/carsim_gui.py
 
@@ -39,12 +43,15 @@ Headless logic check:  python3 tools/carsim_gui.py --check
 """
 
 import argparse
+import atexit
 import json
 import math
 import os
 import re
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -60,7 +67,7 @@ except Exception:                       # non-GUI env / --check still works
     _HAS_TK = False
 
 
-__version__ = "0.9.7"
+__version__ = "0.9.8"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -2262,6 +2269,92 @@ def _headless_check():
     return 0
 
 
+def _is_loopback_host(host):
+    """True when host names this machine's own loopback."""
+    return host in ("", "localhost", "127.0.0.1", "::1")
+
+
+def _port_open(host, port, timeout=0.3):
+    """True when something accepts TCP connections on host:port."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _engine_log_path():
+    """Where the auto-started engine's console output is appended."""
+    return os.path.join(tempfile.gettempdir(), "carsim_engine.log")
+
+
+def _spawn_engine(ctrl_port, slcan_port):
+    """Start the bundled carsim.py (--follower) bound to loopback.
+
+    The engine's stdout/stderr are appended to _engine_log_path() so a
+    cockpit launched from a desktop launcher still leaves a diagnosable
+    trail.  Returns the Popen handle, or None when the engine could not
+    be started.  The caller must ensure _stop_engine() runs on exit.
+    """
+    global _ENGINE_PROC
+    engine = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "carsim.py")
+    try:
+        log_fd = os.open(_engine_log_path(),
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    except OSError:
+        log_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-u", engine,
+             "--host", "127.0.0.1",
+             "--slcan-port", str(slcan_port),
+             "--ctrl-port", str(ctrl_port),
+             "--follower"],
+            stdin=subprocess.DEVNULL, stdout=log_fd,
+            stderr=subprocess.STDOUT)
+    except OSError as exc:
+        os.close(log_fd)
+        print(f"could not auto-start the engine: {exc}", file=sys.stderr)
+        return None
+    os.close(log_fd)          # the child already holds its own copy
+    _ENGINE_PROC = proc
+    return proc
+
+
+def _wait_port(host, port, proc=None, timeout=5.0):
+    """Poll host:port until it accepts connections.
+
+    Gives up early (False) when proc exits before the port opens.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc is not None and proc.poll() is not None:
+            return False
+        if _port_open(host, port):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _stop_engine(proc=None):
+    """Tear down an auto-started engine (SIGTERM, escalate to SIGKILL)."""
+    if proc is None:
+        proc = _ENGINE_PROC
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+
 def main():
     ap = argparse.ArgumentParser(description="Cockpit GUI for carsim.py")
     ap.add_argument("--host", default=DEFAULT_HOST,
@@ -2281,7 +2374,41 @@ def main():
         print("tkinter not available in this environment", file=sys.stderr)
         return 1
 
-    root = tk.Tk()
+    # Single-entry cockpit (v0.9.8): when pointed at a loopback sim that is
+    # not yet listening, auto-start the bundled engine as --follower so a
+    # bare `python3 tools/carsim_gui.py` brings up the whole bench.  A sim
+    # that is already running on the ctrl port is left completely untouched.
+    atexit.register(_stop_engine)
+    if _is_loopback_host(args.host):
+        if not _port_open("127.0.0.1", args.port):
+            engine = _spawn_engine(args.port, args.slcan_port)
+            if engine is None:
+                print("could not auto-start the engine; the cockpit will keep "
+                      "retrying the connection", file=sys.stderr)
+            elif not _wait_port("127.0.0.1", args.port, proc=engine):
+                exited = engine.poll() is not None
+                _stop_engine(engine)
+                if exited:
+                    print("auto-started engine exited early - see "
+                          f"{_engine_log_path()}", file=sys.stderr)
+                else:
+                    print(f"auto-started engine never opened "
+                          f"127.0.0.1:{args.port} - see "
+                          f"{_engine_log_path()}", file=sys.stderr)
+                return 1
+            else:
+                print(f"engine auto-started (ctrl 127.0.0.1:{args.port}, "
+                      f"slcan :{args.slcan_port}); log in "
+                      f"{_engine_log_path()}")
+        else:
+            print(f"sim already listening on 127.0.0.1:{args.port} - "
+                  "reusing it (engine not started)")
+
+    try:
+        root = tk.Tk()
+    except Exception as exc:              # tk importable but no usable display
+        print(f"cannot open the cockpit display: {exc}", file=sys.stderr)
+        return 1
     Cockpit(root, args.host, args.port, args.slcan_port)
     root.mainloop()
     return 0
