@@ -98,6 +98,9 @@ inject. Five frames repeat on the bus:
   of a live flood you spot the moment you flipped a switch instantly.
 
 ### Console / quick inject
+
+To begin playing with this console, you have to start it like you would start a real car. First you have to start up the vehicle in park by pressing I. This will start the ignition. Then you must put the vehicle in drive by pressing D. Then you can start playing with various functions in the vehicle outlined in the instructions section on the console. For example, the gas pedal is the up arrow. The brake pedal is the down arrow, and so on. 
+
 To make a can injection, you can make the car do various things. The best way to do this to demonstrate a replay attack on the vehicle is to take the example of hitting the accelerator (the up arrow). You will see a yellow frame highlight. Then hit freeze on the can bus to stop the traffic and click the frame twice. Make sure it is a frame that starts with Tx, as these are frames that send can messages. It will populate that frame in the box after clicking twice. Once you have the frame in the box, hit enter. It will then accelerate the car and cause it to speed up. This can be done for all kinds of functions such as braking, turning the lights on, etc. This is how a hacker would inject traffic onto the bus. 
 
 You can also hit record to capture an entire session. Can bus traffic will be recorded. Press Record -> perform actions on the vehicle ->  Stop -> Save -> Load - to upload the candump file -> Replay. This will cause all of the traffic that you have recorded to be replayed on the vehicle. This is a candump replay attack.
