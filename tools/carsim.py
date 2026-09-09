@@ -21,6 +21,8 @@ JSON control channel (port 20103) — one 10 Hz state stream + commands:
     RX {"t":"cruise","on":true}           RX {"t":"cruise","delta":5}
     RX {"t":"reset"}
     RX {"t":"frame","id":256,"data":"...hex..."}   # CAN INJECT (id 0x100)
+    RX {"t":"lin","cmd":"LIN_TRUNK_OPEN"}   # LIN INJECT (body module)
+    RX {"t":"lin","id":48,"data":"01"}      # LIN INJECT (raw module frame)
     TX {"t":"state", ...physics, lamps, faults, switches, frames, events}
 
 A diagnostic request frame injected with CAN INJECT is observed but never
@@ -33,6 +35,24 @@ turn) latch the matching switches in ANY mode -- not just --follower --
 so the lamps can be hacked straight off the bus.  The 0x130 BODY bits
 (doors / trunk / hood / belt) latch their switches the same way -- the
 classic one-frame body hack (130#1000... pops the trunk).
+
+Body functions can be driven two ways, matching the two architectures you
+meet on real cars.  The 0x120/0x130 latch above models the *naive-trust*
+vehicle (the ICSim / 2015-Jeep model): the same broadcast the cluster
+reads is also trusted to actuate, so a CAN INJECT replay genuinely turns
+the function on.  The LIN channel below models the modern LIN-slave car,
+where the actuator command lives behind the BCM (0x10 wiper, 0x20 lights,
+0x21 indicators, 0x30 liftgate, 0x40 doors, 0x41 hood/belt) instead of on
+the CAN status frames.  LIN is master/slave: the BCM master polls a
+module and the slave ANSWERS with its output state, so an attack is not a
+broadcast -- it is a *collision-hijack* (Takahashi et al., IPSJ-JIP
+25:220, 2017): inject colliding bits into the genuine slave's response;
+the slave's simple error handling aborts it; your forged response wins
+the slot.  LIN responses carry no authentication, so any byte is
+accepted.  The payload carries the module's *complete* output state, not
+a bit-flip: LIN_HIGHBEAM_ON (0x20#02) also clears the low beam.  LIN
+INJECT: {"t":"lin","cmd":"LIN_TRUNK_OPEN"} or
+{"t":"lin","id":48,"data":"01"}.
 
 Fault deck (toggles the same way the GUI shows them):
     mil      -> P0300  (MIL on, rpm jitter)
@@ -52,13 +72,14 @@ Run "carsim.py --help" for the full option list.
 import argparse
 import json
 import math
+import re
 import socket
 import struct
 import sys
 import threading
 import time
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 # --------------------------------------------------------------------------- #
 #  Constants
@@ -109,6 +130,47 @@ FRAME_GEAR = 0x140            # 100 ms: gear enum fuel% odo(u32 LE) runtime(u16 
 FRAME_DRIVE_IN = 0x400
 DRIVE_IDS = (FRAME_ENGINE, FRAME_CHASSIS, FRAME_STEER, FRAME_GEAR, FRAME_DRIVE_IN)
 
+# LIN body modules (the "LIN INJECT" channel).  A LIN frame is the *forged
+# response* that won a master poll slot (see the module docstring): the
+# payload byte(s) are the exact actuation state the receiver believes the
+# slave reported, so forging 0x02 to the light module also clears 0x01
+# (headlights) -- a whole-byte write, not a toggle.
+LIN_MODULES = {
+    0x10: ("wiper",    {0x01: "wipers"}),
+    0x20: ("light",    {0x01: "headlights", 0x02: "highbeam"}),
+    0x21: ("turn",     {0x01: "left", 0x02: "right", 0x04: "hazard"}),
+    0x30: ("liftgate", {0x01: "trunk"}),
+    0x40: ("door",     {0x01: "door_fl", 0x02: "door_fr",
+                        0x04: "door_rl", 0x08: "door_rr"}),
+    0x41: ("hood",     {0x01: "hood", 0x02: "seatbelt"}),
+}
+
+# Mnemonic LIN commands -> (module id, forged response payload).  Payload is
+# the full module output state, exactly like a raw LIN_xx#dd frame.
+LIN_CMDS = {
+    "LIN_WIPER_ON":    (0x10, b"\x01"),
+    "LIN_WIPER_OFF":   (0x10, b"\x00"),
+    "LIN_LIGHT_ON":    (0x20, b"\x01"),
+    "LIN_LIGHT_OFF":   (0x20, b"\x00"),
+    "LIN_HIGHBEAM_ON": (0x20, b"\x02"),   # teaching point: clears low beam
+    "LIN_LIGHTS_FULL": (0x20, b"\x03"),   # headlights + highbeam
+    "LIN_LEFT_ON":     (0x21, b"\x01"),
+    "LIN_RIGHT_ON":    (0x21, b"\x02"),
+    "LIN_HAZARD_ON":   (0x21, b"\x04"),
+    "LIN_TURN_OFF":    (0x21, b"\x00"),
+    "LIN_TRUNK_OPEN":  (0x30, b"\x01"),
+    "LIN_TRUNK_CLOSE": (0x30, b"\x00"),
+    "LIN_DOOR_FL_ON":  (0x40, b"\x01"),
+    "LIN_DOOR_FR_ON":  (0x40, b"\x02"),
+    "LIN_DOOR_RL_ON":  (0x40, b"\x04"),
+    "LIN_DOOR_RR_ON":  (0x40, b"\x08"),
+    "LIN_DOORS_OFF":   (0x40, b"\x00"),
+    "LIN_HOOD_ON":     (0x41, b"\x01"),
+    "LIN_HOOD_OFF":    (0x41, b"\x00"),
+    "LIN_BELT_ON":     (0x41, b"\x02"),
+    "LIN_BELT_OFF":    (0x41, b"\x00"),
+}
+
 # --------------------------------------------------------------------------- #
 #  Small helpers
 # --------------------------------------------------------------------------- #
@@ -119,6 +181,29 @@ def clamp(x, lo, hi):
 
 def _hexs(data):
     return " ".join(f"{b:02X}" for b in data)
+
+
+def parse_lin_cmd(text):
+    """Parse a LIN INJECT command: a LIN_CMDS mnemonic ("LIN_TRUNK_OPEN")
+    or a raw module frame ("LIN_10#01").  Returns (lin_id, data) or None.
+
+    CAN-style text ("120#0020") is rejected: LIN ids are single-byte module
+    addresses on the body bus, not 11-bit CAN ids."""
+    if not isinstance(text, str):
+        return None
+    s = text.strip()
+    if s in LIN_CMDS:
+        return LIN_CMDS[s]
+    m = re.fullmatch(r"LIN_([0-9A-Fa-f]{2})#([0-9A-Fa-f]{1,16})", s)
+    if not m:
+        return None
+    lin_id = int(m.group(1), 16)
+    if lin_id not in LIN_MODULES:
+        return None
+    data = bytes.fromhex(m.group(2))
+    if not data or len(data) > 8:
+        return None
+    return (lin_id, data)
 
 
 # --------------------------------------------------------------------------- #
@@ -862,6 +947,9 @@ class CarSim:
         self._stop = False
         self._last_frames = []
         self._sent_frames = {}             # id -> last broadcast bytes (snapshot)
+        self._last_lin_frames = []        # LIN bus capture ring (48 records)
+        self._lin_last_rx = {}            # module id -> last emitted RX byte
+        self._lin_poll_next = 0.0         # monotonic deadline, 10 Hz master poll
 
     def _blink(self):
         return 1 if int(self.phys.t / 0.333) % 2 == 0 else 0
@@ -927,6 +1015,9 @@ class CarSim:
             self.switches["seatbelt"] = True
             for k in self.faults:
                 self.faults[k] = False
+            self._last_lin_frames = []
+            self._lin_last_rx = {}
+            self._lin_poll_next = 0.0
             ev.append("sim reset")
         elif t == "frame":
             # CAN INJECT: raw loopback frame from the cockpit GUI or a script,
@@ -943,6 +1034,55 @@ class CarSim:
             if not data or len(data) > 8:
                 return
             self.handle_rx_frame(can_id, data)
+            return
+        elif t == "lin":
+            # LIN INJECT: body functions behind the BCM.  Accepts a mnemonic
+            # ({"t":"lin","cmd":"LIN_TRUNK_OPEN"}) or a raw module frame
+            # ({"t":"lin","id":48,"data":"01"}).  Same early-return shape
+            # as the CAN frame branch above.
+            #
+            # What the injection MEANS physically (Takahashi et al. 2017,
+            # "Automotive Attacks and Countermeasures on LIN-Bus",
+            # IPSJ-JIP 25:220): LIN is master/slave -- the BCM master polls,
+            # the addressed slave answers.  The attacker does NOT broadcast
+            # a command; they COLLIDE with the genuine slave's response
+            # mid-slot.  The slave's simple error handling (it compares the
+            # bus bits against its own transmission and aborts on mismatch)
+            # kills the genuine response, and the attacker finishes the slot
+            # with a forged one.  LIN responses carry no authentication, so
+            # the receiver accepts the attacker's byte.
+            try:
+                if "cmd" in msg:
+                    parsed = parse_lin_cmd(str(msg.get("cmd", "")))
+                    if parsed is None:
+                        return
+                    lin_id, data = parsed
+                else:
+                    raw_id = msg.get("id", 0)
+                    lin_id = int(raw_id) if not isinstance(raw_id, str) \
+                        else int(raw_id, 0)
+                    data = bytes.fromhex(str(msg.get("data", "")))
+            except (KeyError, ValueError, TypeError):
+                return
+            if not data or len(data) > 8:
+                return
+            ev_lin = []
+            genuine = self._lin_module_state(lin_id)
+            if genuine != data[0]:
+                # The genuine slave was mid-answer with the TRUE state when
+                # the collision hit; its error handling aborted it.  Log that
+                # aborted response right before the attacker's forged one so
+                # the ring shows the kill-and-replace, not a clean write.
+                self._capture_lin(lin_id, genuine, "RX")
+                ev_lin.append(
+                    f"LIN collision: module 0x{lin_id:02X} genuine "
+                    f"{genuine:02X} response aborted -> false "
+                    f"{data[0]:02X} accepted")
+            self._handle_lin_frame(lin_id, data, ev_lin)
+            if ev_lin:
+                with self._ev_lock:
+                    self.events.extend(ev_lin)
+            self._capture_lin(lin_id, data[0], "TX")
             return
         if ev:
             with self._ev_lock:
@@ -979,6 +1119,60 @@ class CarSim:
             if self.switches.get(_n) != _on:
                 self.switches[_n] = _on
                 ev.append(f"{_n} {'on' if _on else 'off'} via CAN INJECT")
+
+    # ------------------------------------------------------------ LIN inject
+    def _handle_lin_frame(self, lin_id, data, ev):
+        """A forged LIN *response* arrived via LIN INJECT: apply its state.
+
+        What arrived is not a command from the master (LIN masters never
+        write actuator state; they poll and slaves answer).  It is the
+        attacker's forged response that WON the poll slot: the genuine
+        slave's answer was collided with and aborted by its own error
+        handling (the slave compares the bits on the bus against its own
+        transmission and stops on mismatch), and this byte finished the
+        response in its place.  LIN responses carry no authentication -- a
+        receiver checks only the checksum, which the attacker recomputes --
+        so the attacker can make the module's output byte ANY value
+        (Takahashi et al., IPSJ-JIP 25:220, 2017).  The payload is the
+        module's *complete* output state: bits absent from the byte are OFF.
+        (The 0x120/0x130 CAN latch above models the other real-world
+        architecture -- naive-trust vehicles like the ICSim / 2015-Jeep
+        model, where the broadcast itself actuates.)
+        """
+        mod = LIN_MODULES.get(lin_id)
+        if mod is None or not data:
+            return
+        _name, _bits = mod
+        state = data[0]
+        for _b, _n in _bits.items():
+            _on = bool(state & _b)
+            if self.switches.get(_n) != _on:
+                self.switches[_n] = _on
+                ev.append(f"{_n} {'on' if _on else 'off'} via LIN INJECT")
+
+    # ------------------------------------------------- LIN traffic capture
+    def _lin_module_state(self, lin_id):
+        """Re-derive a body module's current output byte from the switches,
+        as the real LIN master would read back from its slaves."""
+        mod = LIN_MODULES.get(lin_id)
+        if mod is None:
+            return 0
+        out = 0
+        for _b, _n in mod[1].items():
+            if self.switches.get(_n):
+                out |= _b
+        return out
+
+    def _capture_lin(self, lin_id, data_byte, direction):
+        """Append one LIN bus record to the capture ring (cap 48)."""
+        ring = getattr(self, "_last_lin_frames", None)
+        if ring is None:
+            return
+        ring.append({"ts": round(self.phys.t, 2),
+                     "id": lin_id, "data": f"{data_byte:02X}",
+                     "dir": direction})
+        if len(ring) > 48:
+            del ring[:-48]
 
     # -------------------------------------------------------- drive follower
     def _apply_drive_frame(self, can_id, data):
@@ -1092,6 +1286,17 @@ class CarSim:
             self._last_frames = [
                 {"id": fid, "dlc": len(d), "data": d.hex().upper()}
                 for fid, d in sorted(self._sent_frames.items())]
+            # LIN master poll (10 Hz): each RX record is a genuine slave
+            # answering its poll slot with its current output state.  Only
+            # log on change so the capture stays readable and every record
+            # is copy-pasteable into the LIN inject box.
+            if mono >= self._lin_poll_next:
+                self._lin_poll_next = mono + 0.1
+                for _lid in sorted(LIN_MODULES):
+                    _b = self._lin_module_state(_lid)
+                    if self._lin_last_rx.get(_lid) != _b:
+                        self._lin_last_rx[_lid] = _b
+                        self._capture_lin(_lid, _b, "RX")
 
         # 10 Hz state stream to the cockpit
         if int(now * 10.0) != getattr(self, "_last_state_tick", -1):
@@ -1109,6 +1314,7 @@ class CarSim:
         state["faults"] = dict(self.faults)
         state["lamps"] = compute_lamps(self.phys, self.faults, self.switches)
         state["frames"] = getattr(self, "_last_frames", [])
+        state["lin_frames"] = list(getattr(self, "_last_lin_frames", []))
         state["events"] = events[-8:]
         state["dtc"] = [f"{'PCBU'[(h >> 6) & 3]}{((h << 8) | l) & 0x3FFF:04X}"
                         for h, l, _s in engine_dtcs(self.faults)]
@@ -1126,6 +1332,8 @@ class CarSim:
         print(f"  JSON control channel on 127.0.0.1:{self.ctrl_port}")
         print("    commands: input / gear / ignition / switch / fault / cruise / reset")
         print('    CAN INJECT: {"t":"frame","id":256,"data":"0100"}')
+        print('    LIN INJECT: {"t":"lin","cmd":"LIN_TRUNK_OPEN"} /')
+        print('                 {"t":"lin","id":48,"data":"01"}')
         print("  ECUs: engine 7E8, TCM 7E9, ABS 7EA (ISO-TP; exercised by --selftest)")
         print("  broadcast: 0x100/0x110/0x120/0x130/0x140")
         if self.follower:
@@ -1328,6 +1536,15 @@ def selftest():
     items = handle_request(REQ_FUNCTIONAL, b"\x02\x01\x0D", p, faults, 3)
     assert items and items[0][1] == ECU_ENGINE, items
     ok("functional 0x7DF answered by engine 0x7E8")
+
+    # 14) LIN command parsing (mnemonics + raw module frames only)
+    assert parse_lin_cmd("LIN_WIPER_ON") == (0x10, b"\x01"), \
+        parse_lin_cmd("LIN_WIPER_ON")
+    assert parse_lin_cmd("LIN_20#03") == (0x20, b"\x03"), \
+        parse_lin_cmd("LIN_20#03")
+    assert parse_lin_cmd("LIN_BOGUS") is None
+    assert parse_lin_cmd("120#0020") is None   # CAN-style, not a LIN module
+    ok("parse_lin_cmd: mnemonics + raw LIN_xx#dd module frames")
 
     print("\ncarsim selftest: ALL PASS")
     return 0

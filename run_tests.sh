@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Headless verification: syntax, carsim selftest, GUI logic checks, and the
-# e2e regressions (drive, autopilot park-gate, CAN body inject) against a
-# fresh local sim on an isolated port (never collides with a live cockpit).
+# e2e regressions (drive, autopilot park-gate, CAN body inject, LIN inject)
+# against a fresh local sim on an isolated port (never collides with a live
+# cockpit).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -35,5 +36,7 @@ echo "== autopilot phase e2e (park gear gate) =="
 python3 tests/ap_phase_e2e.py
 echo "== CAN body inject (0x130 trunk/doors latch) =="
 python3 tests/body_inject_test.py
+echo "== LIN inject (body modules behind the BCM) =="
+python3 tests/lin_inject_test.py
 
 echo "== ALL TESTS PASS =="

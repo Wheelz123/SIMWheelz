@@ -78,6 +78,76 @@ bits latch the matching switches off the bus in **any** mode, so a single
 `130#1000...` pops the trunk (`130#5000...` pops it with the belt still on)
 and the sim re-broadcasts the state. Doors are bits `0x01`/`0x02`/`0x04`/`0x08`.
 
+
+### LIN INJECT (body modules behind the BCM)
+
+Real cars actuate body functions over different architectures, and this bench
+models both -- the network selector in the inject box decides which one you
+are talking to:
+
+| architecture | where the command lives | sim path |
+|---|---|---|
+| naive-trust (the ICSim / 2015-Jeep model) | the CAN broadcast itself is trusted and actuates | `0x120`/`0x130` CAN INJECT latch (above) |
+| LIN-slave (many modern cars) | actuator commands behind the BCM, off the CAN status frames | LIN INJECT (this section) |
+| defended (modern premium cars) | rolling counters / CRC / SecOC reject naive replays | not modelled -- the wire accepts the frame, the receiver rejects it |
+
+**How it works.**  A LIN frame is the *forged response* that won a master
+poll slot, not a command from the master: LIN is master/slave, the BCM
+polls and slaves answer.  The attack (demonstrated in Takahashi et al.,
+*Automotive Attacks and Countermeasures on LIN-Bus*, IPSJ-JIP 25:220, 2017)
+is a collision, not a broadcast:
+
+1. the master polls a module (break + sync + PID);
+2. the genuine slave starts answering with its TRUE state;
+3. the attacker injects colliding bits mid-response;
+4. the slave's bit-integrity check sees the overwrite, aborts, and waits
+   for the next header;
+5. the attacker finishes the slot with a forged response byte;
+6. receivers accept it -- LIN response frames carry no authentication,
+   only a checksum the attacker recomputes.
+
+**Use it:** switch the inject box to **LIN** and send a mnemonic command or a
+raw module frame:
+
+```
+LIN_TRUNK_OPEN      LIN_WIPER_ON       LIN_LIGHT_ON        LIN_HAZARD_ON
+LIN_HIGHBEAM_ON     LIN_LIGHTS_FULL    LIN_20#03           LIN_30#01
+```
+
+The frame ID is the module address; the payload byte is the module's
+**complete output state**:
+
+| id | module | bits |
+|---|---|---|
+| `0x10` | wiper | `0x01` wipers |
+| `0x20` | light | `0x01` headlights, `0x02` highbeam |
+| `0x21` | turn | `0x01` left, `0x02` right, `0x04` hazard |
+| `0x30` | liftgate | `0x01` trunk |
+| `0x40` | door | `0x01` FL, `0x02` FR, `0x04` RL, `0x08` RR |
+| `0x41` | hood | `0x01` hood, `0x02` belt |
+
+**Whole-byte semantics:** the forged response replaces the module's whole
+output state, not a single bit -- `LIN_HIGHBEAM_ON` (`0x20#02`) also clears
+the low beam, and `0x20#03` is headlights + highbeam.  The BCM notices the
+change and the CAN status frames (`0x120` lamps, `0x130` body) re-encode it,
+exactly as a real cluster would.
+
+Which architecture a given car uses varies by make/model/year: on many
+vehicles these functions are genuine CAN command frames (central locking
+everywhere; the 2015 Jeep wipers/headlights research; Car Hacking Village and
+CTF demos), on others they are LIN slaves or BCM-internal, and on modern
+premium cars rolling counters / CRC / SecOC block naive replays.  The bench
+lets you practice both paths; on a real bus the first job is classifying
+which one you are looking at.
+
+**Capture:** tick the **LIN view** checkbox in the CAN BUS monitor and
+the window shows the LIN capture ring instead of the CAN stream.  Every
+`RX` record is a genuine slave answering its poll slot (`LIN_20#03  RX`)
+-- including the answer a collision aborts; the attacker's forged response
+appears as `TX` (`LIN_30#01  TX`), so the ring shows the kill-and-replace
+in order: true answer killed, forged answer accepted.  Each line is raw
+frame syntax, so copy it straight into the **LIN** inject box.
+
 ---
 
 ## 4. Reading the CAN BUS monitor

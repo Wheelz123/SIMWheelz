@@ -10,6 +10,8 @@ publishes everything over a JSON control channel (default 127.0.0.1:20103):
     RX {"t":"gear","gear":"D"}  {"t":"ignition","on":true}
     RX {"t":"switch","name":"hazard","on":true}   {"t":"fault","name":"mil","on":true}
     RX {"t":"cruise","on":true}  {"t":"cruise","delta":5}   {"t":"reset"}
+    RX {"t":"lin","cmd":"LIN_TRUNK_OPEN"}   # LIN INJECT (body module)
+    RX {"t":"lin","id":48,"data":"01"}      # LIN INJECT (raw module frame)
 
 The simulator is loopback-only: raw CAN frames are injected over the same
 JSON control channel, so the CAN CONSOLE below sends "cansend-style"
@@ -19,7 +21,16 @@ before the loopback-only refactor.  With the sim started --follower,
 injected 0x100/0x110/0x120/0x140/0x400 frames fold into the physics and
 the game reacts.  Injected 0x120 lamp bits and 0x130 body bits latch
 their switches in ANY mode -- the one-frame lamp/body hack
-(130#5000... pops the trunk with the belt still on).
+(130#5000... pops the trunk with the belt still on).  Body functions
+can also be driven over LIN -- the other real-world architecture, common
+on modern cars behind the BCM: 0x10 wiper, 0x20 lights, 0x21 indicators,
+0x30 liftgate, 0x40 doors,
+0x41 hood/belt.  LIN is master/slave, so the injected "frame" is the
+attacker's FORGED RESPONSE that won the poll slot (a collision aborts the
+genuine slave's answer via its own error handling; LIN responses carry no
+authentication).  The payload carries the module *output state* (whole
+byte -- LIN_HIGHBEAM_ON also clears the low beam), injected as
+{"t":"lin","cmd":"LIN_TRUNK_OPEN"} or {"t":"lin","id":48,"data":"01"}.
   * LEFT  - scrolling road + car sprite (the "game view")
   * MID   - tiled 3x3 instrument cluster (small non-overlapping gauges) + odo
   * RIGHT - warning lamps, live-data table, CAN console + quick inject, controls
@@ -58,6 +69,12 @@ import threading
 import time
 
 try:
+    from carsim import LIN_CMDS, LIN_MODULES, parse_lin_cmd
+except ModuleNotFoundError:   # imported as tools.carsim_gui (tests):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from carsim import LIN_CMDS, LIN_MODULES, parse_lin_cmd
+
+try:
     import tkinter as tk
     from tkinter import ttk
     from tkinter import filedialog
@@ -69,7 +86,7 @@ except Exception:                       # non-GUI env / --check still works
     _HAS_TK = False
 
 
-__version__ = "0.9.11"
+__version__ = "0.9.12"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -432,7 +449,10 @@ class CanInjector:
     def send_frame(self, can_id, data):
         if not data:
             return False
-        msg = {"t": "frame", "id": can_id, "data": data.hex()}
+        return self.send_json({"t": "frame", "id": can_id, "data": data.hex()})
+
+    def send_json(self, msg):
+        """Send one JSON control-channel message (CAN frame, LIN frame, ...)."""
         with self._lock:
             s = self.sock
         if s is None:
@@ -686,6 +706,12 @@ class Cockpit:
         self._state = msg
         self._ev_q.extend(msg.get("events", []))
         self._sync_frames(msg.get("frames", []))
+        lf = msg.get("lin_frames")
+        if lf is not None:
+            lf = list(lf)
+            if lf != getattr(self, "_last_lin_frames", None):
+                self._last_lin_frames = lf
+                self._bus_seq += 1
 
     def _sync_frames(self, frames):
         # log EVERY received frame so the CAN BUS monitor shows the live
@@ -1032,11 +1058,16 @@ class Cockpit:
                                 font=("Consolas", 9), padx=6, pady=3,
                                 relief="flat")
         self.live_txt.grid(row=1, column=0, sticky="nsew", padx=4, pady=(4, 0))
-        cframe = ttk.LabelFrame(cockpit, text="CAN INJECT (cansend / console)")
+        cframe = ttk.LabelFrame(cockpit, text="INJECT (CAN / LIN - pick the network)")
         cframe.grid(row=2, column=0, sticky="ew", padx=4, pady=(4, 2))
         self.inject_var = tk.StringVar(value="cansend vcan0 400#FF00038000000000")
         row = ttk.Frame(cframe)
         row.pack(fill="x", padx=4, pady=(4, 2))
+        self.inject_net = ttk.Combobox(row, values=("CAN", "LIN"), width=5,
+                                       state="readonly")
+        self.inject_net.set("CAN")
+        self.inject_net.pack(side="left", padx=(0, 4))
+        self.inject_net.bind("<<ComboboxSelected>>", self._net_changed)
         self.inject_entry = ttk.Entry(row, textvariable=self.inject_var)
         self.inject_entry.pack(side="left", fill="x", expand=True)
         self.inject_entry.bind("<Return>", self._send_inject)
@@ -1085,6 +1116,9 @@ class Cockpit:
         self._rxdelta_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(r1, text="RX changed only",
                         variable=self._rxdelta_var).pack(side="left", padx=8)
+        self._lin_view_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(r1, text="LIN view",
+                        variable=self._lin_view_var).pack(side="left", padx=8)
         r2 = ttk.Frame(recf)
         r2.pack(fill="x", padx=4, pady=(0, 3))
         ttk.Label(r2, text="id filter").pack(side="left")
@@ -1241,6 +1275,23 @@ class Cockpit:
         self.bus_txt.tag_configure("tx", foreground="#ffd60a")
         self.bus_txt.tag_configure("chg", background="#17323d",
                                    foreground="#34d1ce")
+        lin_var = getattr(self, "_lin_view_var", None)
+        if lin_var is not None and lin_var.get():
+            # LIN view: render the LIN capture ring (10 Hz master poll RX
+            # = genuine slave answers -- including ones aborted by an
+            # attack -- + forged TX responses) in raw form, ready to paste
+            # into LIN INJECT
+            for rec in getattr(self, "_last_lin_frames", []):
+                line = (f"LIN_{rec['id']:02X}#{rec['data']}  "
+                        f"{rec['dir']}  ts={rec['ts']}")
+                self.bus_txt.insert("end", line + "\n")
+                self.bus_txt.tag_add(
+                    "tx" if rec["dir"] == "TX" else "capture",
+                    "end-%dc" % (len(line) + 1), "end-1c")
+            self.bus_txt.configure(state="disabled")
+            if tail:
+                self.bus_txt.see("end")
+            return
         for rec in view:
             try:
                 dec = decode_frame(rec)
@@ -1411,6 +1462,19 @@ class Cockpit:
             except Exception:
                 pass
 
+    def _net_changed(self, _ev=None):
+        """Inject-network selector: CAN (ID#DATA / cansend) vs LIN (mnemonics
+        or raw LIN_xx#dd module frames)."""
+        net = getattr(self, "inject_net", None)
+        if net is None:
+            return
+        if net.get() == "LIN":
+            self._inject_fb("hint", "LIN INJECT: LIN_TRUNK_OPEN or LIN_30#01 "
+                            "(forged slave response - whole-byte state)")
+        else:
+            self._inject_fb("hint", "type ID#DATA (e.g. 110#4700000000000000) "
+                            "or cansend vcan0 ID#DATA, then press Enter or SEND")
+
     def _send_inject(self, _ev=None):
         text = self.inject_var.get()
         # Debounce keyboard auto-repeat from a held Enter key.
@@ -1419,6 +1483,28 @@ class Cockpit:
             return
         self._inj_last_txt = text
         self._inj_last_t = time.time()
+        net = getattr(self, "inject_net", None)
+        if net is not None and net.get() == "LIN":
+            parsed = parse_lin_cmd(text)
+            if parsed is None:
+                self._log("LIN INJECT FAIL bad command: " + text.strip())
+                self._inject_fb("fail", "bad LIN command - use e.g. "
+                                "LIN_TRUNK_OPEN or LIN_30#01")
+                return
+            lin_id, data = parsed
+            if not self.injector.send_json({"t": "lin", "id": lin_id,
+                                            "data": data.hex()}):
+                self._log("LIN INJECT FAIL injector offline")
+                self._inject_fb("fail", "injector offline - is the engine running?")
+                return
+            _name, _bits = LIN_MODULES[lin_id]
+            _ons = [n for b, n in _bits.items() if data[0] & b]
+            self._log("LIN INJECT OK %s %s"
+                      % (_name, " ".join(_ons) if _ons else "all off"))
+            self._inject_fb("ok", "LIN %s#%02X sent - module state: %s"
+                            % (hex(lin_id), data[0],
+                               ", ".join(_ons) if _ons else "all off"))
+            return
         parsed = parse_cansend(text)
         if parsed is None:
             self._log("INJECT FAIL bad frame: " + text.strip())
@@ -1829,7 +1915,33 @@ class Cockpit:
             self._cap_lbl.configure(text="COPIED  " + line)
 
     def _bus_load(self, ev):
-        """Double click: copy AND load the frame into the CAN INJECT box."""
+        """Double click: copy AND load the frame into the CAN INJECT box.
+
+        In LIN view the capture lines come from the LIN ring (not
+        frame_history), so parse the clicked widget line directly and fill
+        the inject box + switch the network selector to LIN.
+        """
+        lin_var = getattr(self, "_lin_view_var", None)
+        if lin_var is not None and lin_var.get():
+            try:
+                ln = int(str(self.bus_txt.index(
+                    "@%d,%d" % (ev.x, ev.y))).split(".")[0])
+                line = self.bus_txt.get(f"{ln}.0", f"{ln}.end")
+            except Exception:
+                return
+            m = re.search(r"LIN_([0-9A-Fa-f]{2})#([0-9A-Fa-f]+)", line)
+            if m:
+                frame = f"LIN_{m.group(1).upper()}#{m.group(2).upper()}"
+                self.inject_var.set(frame)
+                net = getattr(self, "inject_net", None)
+                if net is not None:
+                    net.set("LIN")
+                    self._net_changed()
+                self._clipline(frame)
+                self._log("inject <- " + frame)
+                if self._cap_lbl is not None:
+                    self._cap_lbl.configure(text="INJECT <-   " + frame)
+                return
         rec = self._bus_line_rec(self.bus_txt.index("@%d,%d" % (ev.x, ev.y)))
         if not rec:
             return
@@ -2300,6 +2412,16 @@ def _headless_check():
     c = rec_to_cansend(items)
     checks.append(("rec_to_cansend", "400#FF00038000000000" in c and
                    "100#28024463C0000900" in c))
+
+    # ---- LIN inject parsing (v0.9.12)
+    p = parse_lin_cmd("LIN_TRUNK_OPEN")
+    checks.append(("lin mnemonic", p == (0x30, bytes.fromhex("01"))))
+    checks.append(("lin raw", parse_lin_cmd("LIN_20#03") == (0x20, b"\x03")))
+    checks.append(("lin raw door", parse_lin_cmd("LIN_40#01") == (0x40, b"\x01")))
+    checks.append(("lin rejects can", parse_lin_cmd("400#FF00038000000000") is None))
+    checks.append(("lin rejects junk", parse_lin_cmd("LIN_BOGUS") is None))
+    checks.append(("lin map ids", sorted(LIN_MODULES) == [0x10, 0x20, 0x21,
+                  0x30, 0x40, 0x41]))
 
     fail = 0
     for name, ok in checks:
