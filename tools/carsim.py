@@ -29,7 +29,8 @@ protocol (single/multi-frame replies, FlowControl pacing, DTCs, VIN) is
 exercised headlessly by --selftest.  With --follower, injected drive frames
 (0x100/0x110/0x120/0x140/0x400) are folded into the physics as remote
 input.  The 0x120 STEER lamp bits (headlights / highbeam / wipers / hazard /
-turn) latch the matching switches, so the lamps can be hacked off the bus.
+turn) latch the matching switches in ANY mode -- not just --follower --
+so the lamps can be hacked straight off the bus.
 
 Fault deck (toggles the same way the GUI shows them):
     mil      -> P0300  (MIL on, rpm jitter)
@@ -55,7 +56,7 @@ import sys
 import threading
 import time
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 # --------------------------------------------------------------------------- #
 #  Constants
@@ -945,6 +946,20 @@ class CarSim:
             with self._ev_lock:
                 self.events.extend(ev)
 
+    # ------------------------------------------------------------ lamp latch
+    def _latch_lamp_bits(self, bits, ev):
+        """0x120 STEER byte1 -> switches: headlights 0x10, wipers 0x20,
+        hazard 0x04, highbeam 0x08, left 0x01, right 0x02.  Runs in ANY
+        mode (an injected frame flips the switch; the sim's own broadcast
+        then re-encodes it) -- the classic one-frame lamp hack."""
+        for _n, _b in (("headlights", 0x10), ("highbeam", 0x08),
+                       ("wipers", 0x20), ("hazard", 0x04),
+                       ("left", 0x01), ("right", 0x02)):
+            _on = bool(bits & _b)
+            if self.switches.get(_n) != _on:
+                self.switches[_n] = _on
+                ev.append(f"{_n} {'on' if _on else 'off'} via CAN INJECT")
+
     # -------------------------------------------------------- drive follower
     def _apply_drive_frame(self, can_id, data):
         """ICSim-style: fold external drive frames into the physics.
@@ -974,13 +989,7 @@ class CarSim:
                 s -= 256
             self.phys.steer = clamp(s / 100.0, -1.0, 1.0)
             if len(data) >= 2:                       # 0x120 lamp bits latch switches
-                for _n, _b in (("headlights", 0x10), ("highbeam", 0x08),
-                               ("wipers", 0x20), ("hazard", 0x04),
-                               ("left", 0x01), ("right", 0x02)):
-                    _on = bool(data[1] & _b)
-                    if self.switches.get(_n) != _on:
-                        self.switches[_n] = _on
-                        ev.append(f"{_n} {'on' if _on else 'off'} via CAN INJECT")
+                self._latch_lamp_bits(data[1], ev)
         elif can_id == FRAME_GEAR:                   # gear frame
             g = GEAR_FROM.get(data[0] & 0x0F)
             if g:
@@ -996,6 +1005,16 @@ class CarSim:
         """A raw CAN frame arrived via CAN INJECT on the JSON control channel."""
         if not data:
             return
+        # 0x120 STEER lamp bits latch the switches in ANY mode (headlights,
+        # wipers, hazard, highbeam, indicators) so the lights are a one-frame
+        # hack regardless of how the sim was started; steer byte0 still folds
+        # only in --follower below.
+        if can_id == FRAME_STEER and len(data) >= 2:
+            ev = []
+            self._latch_lamp_bits(data[1], ev)
+            if ev:
+                with self._ev_lock:
+                    self.events.extend(ev)
         # ICSim-style: external drive frames fold straight into the physics
         if self.follower and can_id in DRIVE_IDS:
             self._apply_drive_frame(can_id, data)

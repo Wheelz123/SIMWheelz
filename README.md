@@ -149,8 +149,10 @@ The **CAN INJECT** bar parses `cansend`-style `ID#DATA` lines (e.g.
 send. Quick-inject buttons emit `DRIVE_IN` frames. Anything you inject shows up
 amber in the monitor and, in `--follower` mode, actually moves the car.
 
-The **0x120 STEER frame's lamp bits latch the switches** in `--follower`
-mode, so the lights are a one-frame hack off the bus:
+The **0x120 STEER frame's lamp bits latch the switches** in *any* mode
+(headlights · wipers · hazard · highbeam · indicators), so the lights are
+a one-frame hack off the bus — steer byte0 itself still needs
+`--follower`:
 `120#0010…` headlights · `120#0020…` wipers · `120#0004…` hazard ·
 `120#0008…` highbeam · `120#0001…`/`120#0002…` left/right indicator ·
 `120#0000…` everything off (byte 1: `0x01` left · `0x02` right · `0x04`

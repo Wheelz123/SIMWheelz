@@ -67,7 +67,7 @@ except Exception:                       # non-GUI env / --check still works
     _HAS_TK = False
 
 
-__version__ = "0.9.9"
+__version__ = "0.9.10"
 
 DEFAULT_HOST = "127.0.0.1"
 CTRL_PORT = 20103            # JSON control channel (matches carsim CTRL_PORT)
@@ -263,7 +263,9 @@ def parse_cansend(text):
 # 0x400 DRIVE_IN is the only frame the sim consumes as a drivetrain command,
 # and only when carsim.py was started with --follower.  The 0x1xx IDs are the
 # status broadcasts the sim itself publishes every cycle (engine, chassis,
-# steer/lights, body, gear/fuel): putting them on the wire never moves the car.
+# steer/lights, body, gear/fuel): putting them on the wire never moves the
+# car - but 0x120's lamp bits latch the headlight/wiper/hazard/highbeam/
+# indicator switches in ANY mode (one-frame lamp hack).
 STATUS_IDS = frozenset((0x100, 0x110, 0x120, 0x130, 0x140))
 
 
@@ -273,6 +275,12 @@ def inject_advisory(can_id):
     if can_id == DRIVE_IN:
         return ("DRIVE_IN cmd - the sim applies 0x400 only when started with "
                 "--follower (keyboard drive regardless)")
+    if can_id == 0x120:                # steer + lamp bits
+        return ("0x120 STEER lamp bits latch the switches off the bus in "
+                "any mode: byte 1 headlights 0x10, wipers 0x20, hazard "
+                "0x04, highbeam 0x08, left/right indicator 0x01/0x02; "
+                "120#0000... all off (steer byte0 itself still needs "
+                "--follower)")
     if can_id in STATUS_IDS:
         return ("status frame (%s %s) - the sim publishes these itself, so "
                 "injecting one never commands the drivetrain; to drive, send "
@@ -1422,6 +1430,11 @@ class Cockpit:
         if can_id == DRIVE_IN:
             self._inject_fb("note", "0x400 DRIVE_IN sent - the engine "
                             "applies it only while running as follower")
+        elif can_id == 0x120:
+            self._inject_fb("ok", "%s lamp bits sent - byte1 headlights "
+                            "0x10, wipers 0x20, hazard 0x04, highbeam "
+                            "0x08, indicators 0x01/0x02 latch the "
+                            "switches in any mode" % hex(can_id))
         elif can_id in STATUS_IDS:
             self._inject_fb("note", "%s %s sent - it is an engine status "
                             "broadcast and cannot move the car (see Service "
@@ -2371,7 +2384,7 @@ def main():
         print("tkinter not available in this environment", file=sys.stderr)
         return 1
 
-    # Single-entry cockpit (v0.9.9):
+    # Single-entry cockpit (v0.9.10):
     # not yet listening, auto-start the bundled engine as --follower so a
     # bare `python3 tools/carsim_gui.py` brings up the whole bench.  A sim
     # that is already running on the ctrl port is left completely untouched.
