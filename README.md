@@ -75,7 +75,40 @@ you cannot crank in D.
 
 ---
 
-## 3. Body switches (doors / trunk / hood / belt)
+## 3. Reading the CAN BUS monitor
+
+The **CAN BUS** tab streams every broadcast frame it hears plus anything you
+inject. Five frames repeat on the bus:
+
+| ID | name | rate | decoded fields |
+|---|---|---|---|
+| `0x100` | ENGINE | 20 ms | RPM · load · coolant · MAF |
+| `0x110` | CHASSIS | 20 ms | speed · flags |
+| `0x120` | STEER | 50 ms | steering · lamp bits |
+| `0x130` | BODY | 50 ms | doors · trunk · hood · belt |
+| `0x140` | GEAR | 100 ms | gear · fuel · odo |
+| `0x400` | DRIVE_IN | on inject | throttle · brake · gear · steer |
+
+### It's readable now
+- **Names decoded.** `0x130` prints the doors by name instead of a bitmask
+  number, e.g. `doors FL,FR` or `all closed`, plus `trunk/hood/belt`. You can
+  tell exactly which door is open without decoding hex.
+- **Change highlight.** The frame that *just* changed is shown in **cyan**
+  (`chg`); any frame the cockpit itself sent is **yellow** (`tx`). In the middle
+  of a live flood you spot the moment you flipped a switch instantly.
+
+### Console / quick inject - CAN BUS
+
+To begin playing with this console, you have to start it like you would start a real car. First you have to start up the vehicle in park by pressing I. This will start the ignition. Then you must put the vehicle in drive by pressing D. Then you can start playing with various functions in the vehicle outlined in the instructions section on the console. For example, the gas pedal is the up arrow. The brake pedal is the down arrow, and so on. 
+
+To make a can injection, you can make the car do various things. The best way to do this to demonstrate a replay attack on the vehicle is to take the example of hitting the accelerator (the up arrow). You will see a yellow frame highlight. Then hit freeze on the can bus to stop the traffic and click the frame twice. It will populate that frame in the box after clicking twice. Once you have the frame in the box, hit enter. It will then accelerate the car and cause it to speed up. This can be done for all kinds of functions such as braking, turning the lights on, etc. This is how a hacker would inject traffic onto the bus. 
+
+You can also hit record to capture an entire session. Can bus traffic will be recorded. Press Record -> perform actions on the vehicle ->  Stop -> Save -> Load - to upload the candump file -> Replay. This will cause all of the traffic that you have recorded to be replayed on the vehicle. This is a candump replay attack.
+
+ This is how a real life attacker would compromise a vehicle if they are able to gain a foothold on the canbus. Have fun playing with the car!
+---
+
+## 4. Body switches (doors / trunk / hood / belt)
 
 The **Switches** panel in the service column has checkboxes that put real
 traffic onto the bus:
@@ -130,40 +163,6 @@ In simpler terms, the attacker is a sneaky student hiding in the room:
 Why it works: The master trusts whoever finishes the slot. There's no signature to check.
 
 **Use it:** switch the inject box to **LIN** and Monitor to **LIN View.** Then turn on the switch to the trunk, and then turn off the trunk to close it, for example. Then double click the LIN frame that opened the trunk. It will populate into the inject box. Then send the collision data. This will open the trunk. 
-
----
-
-## 4. Reading the CAN BUS monitor
-
-The **CAN BUS** tab streams every broadcast frame it hears plus anything you
-inject. Five frames repeat on the bus:
-
-| ID | name | rate | decoded fields |
-|---|---|---|---|
-| `0x100` | ENGINE | 20 ms | RPM · load · coolant · MAF |
-| `0x110` | CHASSIS | 20 ms | speed · flags |
-| `0x120` | STEER | 50 ms | steering · lamp bits |
-| `0x130` | BODY | 50 ms | doors · trunk · hood · belt |
-| `0x140` | GEAR | 100 ms | gear · fuel · odo |
-| `0x400` | DRIVE_IN | on inject | throttle · brake · gear · steer |
-
-### It's readable now
-- **Names decoded.** `0x130` prints the doors by name instead of a bitmask
-  number, e.g. `doors FL,FR` or `all closed`, plus `trunk/hood/belt`. You can
-  tell exactly which door is open without decoding hex.
-- **Change highlight.** The frame that *just* changed is shown in **cyan**
-  (`chg`); any frame the cockpit itself sent is **yellow** (`tx`). In the middle
-  of a live flood you spot the moment you flipped a switch instantly.
-
-### Console / quick inject - CAN BUS
-
-To begin playing with this console, you have to start it like you would start a real car. First you have to start up the vehicle in park by pressing I. This will start the ignition. Then you must put the vehicle in drive by pressing D. Then you can start playing with various functions in the vehicle outlined in the instructions section on the console. For example, the gas pedal is the up arrow. The brake pedal is the down arrow, and so on. 
-
-To make a can injection, you can make the car do various things. The best way to do this to demonstrate a replay attack on the vehicle is to take the example of hitting the accelerator (the up arrow). You will see a yellow frame highlight. Then hit freeze on the can bus to stop the traffic and click the frame twice. It will populate that frame in the box after clicking twice. Once you have the frame in the box, hit enter. It will then accelerate the car and cause it to speed up. This can be done for all kinds of functions such as braking, turning the lights on, etc. This is how a hacker would inject traffic onto the bus. 
-
-You can also hit record to capture an entire session. Can bus traffic will be recorded. Press Record -> perform actions on the vehicle ->  Stop -> Save -> Load - to upload the candump file -> Replay. This will cause all of the traffic that you have recorded to be replayed on the vehicle. This is a candump replay attack.
-
-Have fun playing with the car! This is how a real life attacker would compromise a vehicle if they are able to gain a foothold on the canbus. 
 
 ---
 
