@@ -55,7 +55,7 @@ instructions.
 
 ### Keyboard
 ```
-DRIVE    W/↑ gas   S/↓ brake   A/← steer L   D/→ steer R
+DRIVE    W/↑ gas   S/↓ brake   ← steer L   → steer R
 KEYBOARD P R N D gear   I IGNITION   SPACE parkbrake
          H hazards   C cruise   +/- set   A autopilot   U units   R reset
 ```

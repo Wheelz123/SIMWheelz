@@ -1116,8 +1116,10 @@ class Cockpit:
         self._rxdelta_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(r1, text="RX changed only",
                         variable=self._rxdelta_var).pack(side="left", padx=8)
+        r1b = ttk.Frame(recf)
+        r1b.pack(fill="x", padx=4, pady=(0, 3))
         self._lin_view_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(r1, text="LIN view",
+        ttk.Checkbutton(r1b, text="LIN view (show the LIN capture ring)",
                         variable=self._lin_view_var).pack(side="left", padx=8)
         r2 = ttk.Frame(recf)
         r2.pack(fill="x", padx=4, pady=(0, 3))
@@ -1424,7 +1426,7 @@ class Cockpit:
                  anchor="w").pack(side="left", padx=(10, 0))
 
         # Primary drive row: larger + amber so the arrow keys are legible.
-        tk.Label(f, text="DRIVE   W/↑ gas   S/↓ brake   A/← steer L   D/→ steer R",
+        tk.Label(f, text="DRIVE   W/↑ gas   S/↓ brake   ← steer L   → steer R",
                  bg="#101418", fg="#ffd60a", font=("Consolas", 11),
                  anchor="w").pack(fill="x")
         kb = ("KEYBOARD   P R N D gear   I IGNITION   SPACE parkbrake   "
