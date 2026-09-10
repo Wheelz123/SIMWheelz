@@ -28,6 +28,7 @@ macOS
 ``` bash
 brew install tkinter
 ```
+INSTALLATION:
 ``` bash
 git clone https://github.com/Wheelz123/SIMWheelz.git
 ```
