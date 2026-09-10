@@ -32,7 +32,7 @@ brew install tkinter
 git clone https://github.com/Wheelz123/SIMWheelz.git
 ```
 
-## 1. Quick start — one command
+## 1. Quick start
 
 ```bash
 cd SIMWheelz
