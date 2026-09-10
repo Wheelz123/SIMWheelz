@@ -7,6 +7,32 @@ A virtual car that speaks **real OBD-II,CAN,UDS,and LIN** with a drivable game c
 **One command starts the entire bench.** 
 ---
 
+## Installation
+
+### Prerequisites
+
+- **Python 3.8+** (standard library only — no pip packages required)
+- **Linux/macOS** (Tkinter must be available for the GUI)
+
+### Install Tkinter (if missing)
+
+**Ubuntu/Debian/Pop!_OS:**
+```bash
+sudo apt update && sudo apt install python3-tk
+```
+Fedora
+``` bash
+sudo dnf install python3-tkinter
+```
+macOS
+``` bash
+brew install tkinter
+```
+``` bash
+git clone https://github.com/Wheelz123/SIMWheelz.git
+```
+cd SIMWheelz
+
 ## 1. Quick start — one command
 
 ```bash
