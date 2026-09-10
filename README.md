@@ -81,72 +81,25 @@ and the sim re-broadcasts the state. Doors are bits `0x01`/`0x02`/`0x04`/`0x08`.
 
 ### LIN INJECT (body modules behind the BCM)
 
-Real cars actuate body functions over different architectures, and this bench
-models both -- the network selector in the inject box decides which one you
-are talking to:
+I also added an additional feature to intercept LIN (Local Interconnect Network) frames. This function was added because features on the simulator such as headlights, wipers, hazard lights, and the trunk typically are controlled by LIN. Although I have baked in the ability to intercept these functions as can frames, typically these components are not controlled by the can bus but the LIN BUS. Therefore, I have added the ability to turn on a LIN Monitor and a LIN collision injection attack. To use this feature for intercepting LIN frames and launching an attack, you have to select LIN next to the INJECT box, and check LIN view as seen in the picture. 
+<img width="1914" height="980" alt="image" src="https://github.com/user-attachments/assets/1efe672b-4ca0-4c96-93e0-0f1b5d54a8d3" />
 
-| architecture | where the command lives | sim path |
-|---|---|---|
-| naive-trust (the ICSim / 2015-Jeep model) | the CAN broadcast itself is trusted and actuates | `0x120`/`0x130` CAN INJECT latch (above) |
-| LIN-slave (many modern cars) | actuator commands behind the BCM, off the CAN status frames | LIN INJECT (this section) |
-| defended (modern premium cars) | rolling counters / CRC / SecOC reject naive replays | not modelled -- the wire accepts the frame, the receiver rejects it |
 
-**How it works.**  A LIN frame is the *forged response* that won a master
-poll slot, not a command from the master: LIN is master/slave, the BCM
-polls and slaves answer.  The attack (demonstrated in Takahashi et al.,
-*Automotive Attacks and Countermeasures on LIN-Bus*, IPSJ-JIP 25:220, 2017)
-is a collision, not a broadcast:
 
-1. the master polls a module (break + sync + PID);
-2. the genuine slave starts answering with its TRUE state;
-3. the attacker injects colliding bits mid-response;
-4. the slave's bit-integrity check sees the overwrite, aborts, and waits
-   for the next header;
-5. the attacker finishes the slot with a forged response byte;
-6. receivers accept it -- LIN response frames carry no authentication,
-   only a checksum the attacker recomputes.
+**How it works.** A LIN attack is not a direct injection attack as seen in the can bus.  A successful LIN frame attack is the *forged response* that won a master (Body Control Module) poll slot, not a command from the master: LIN is master/slave, the BCM polls and slaves answer.  The attack (demonstrated in Takahashi et al.,*Automotive Attacks and Countermeasures on LIN-Bus*, IPSJ-JIP 25:220, 2017) is a collision, not a broadcast like in can injection attacks. :
 
-**Use it:** switch the inject box to **LIN** and send a mnemonic command or a
-raw module frame:
+In simpler terms, the attacker is a sneaky student hiding in the room:
 
-```
-LIN_TRUNK_OPEN      LIN_WIPER_ON       LIN_LIGHT_ON        LIN_HAZARD_ON
-LIN_HIGHBEAM_ON     LIN_LIGHTS_FULL    LIN_20#03           LIN_30#01
-```
+1. The master asks Student 20 for its status.
+2. Student 20 starts answering.
+3. The attacker starts talking at the exact same time, creating a collision.
+4. Student 20 hears the mess, stops, and goes quiet.
+5. The attacker finishes the answer with their own fake data.
+6. The master thinks it's the real answer and accepts it.
+   
+Why it works: The master trusts whoever finishes the slot. There's no signature to check.
 
-The frame ID is the module address; the payload byte is the module's
-**complete output state**:
-
-| id | module | bits |
-|---|---|---|
-| `0x10` | wiper | `0x01` wipers |
-| `0x20` | light | `0x01` headlights, `0x02` highbeam |
-| `0x21` | turn | `0x01` left, `0x02` right, `0x04` hazard |
-| `0x30` | liftgate | `0x01` trunk |
-| `0x40` | door | `0x01` FL, `0x02` FR, `0x04` RL, `0x08` RR |
-| `0x41` | hood | `0x01` hood, `0x02` belt |
-
-**Whole-byte semantics:** the forged response replaces the module's whole
-output state, not a single bit -- `LIN_HIGHBEAM_ON` (`0x20#02`) also clears
-the low beam, and `0x20#03` is headlights + highbeam.  The BCM notices the
-change and the CAN status frames (`0x120` lamps, `0x130` body) re-encode it,
-exactly as a real cluster would.
-
-Which architecture a given car uses varies by make/model/year: on many
-vehicles these functions are genuine CAN command frames (central locking
-everywhere; the 2015 Jeep wipers/headlights research; Car Hacking Village and
-CTF demos), on others they are LIN slaves or BCM-internal, and on modern
-premium cars rolling counters / CRC / SecOC block naive replays.  The bench
-lets you practice both paths; on a real bus the first job is classifying
-which one you are looking at.
-
-**Capture:** tick the **LIN view** checkbox in the CAN BUS monitor and
-the window shows the LIN capture ring instead of the CAN stream.  Every
-`RX` record is a genuine slave answering its poll slot (`LIN_20#03  RX`)
--- including the answer a collision aborts; the attacker's forged response
-appears as `TX` (`LIN_30#01  TX`), so the ring shows the kill-and-replace
-in order: true answer killed, forged answer accepted.  Each line is raw
-frame syntax, so copy it straight into the **LIN** inject box.
+**Use it:** switch the inject box to **LIN** and Monitor to **LIN View.** Then turn on the switch to the trunk, and then turn off the trunk to close it, for example. Then double click the LIN frame that opened the trunk. It will populate into the inject box. Then send the collision data. This will open the trunk. 
 
 ---
 
@@ -172,7 +125,7 @@ inject. Five frames repeat on the bus:
   (`chg`); any frame the cockpit itself sent is **yellow** (`tx`). In the middle
   of a live flood you spot the moment you flipped a switch instantly.
 
-### Console / quick inject
+### Console / quick inject - CAN BUS
 
 To begin playing with this console, you have to start it like you would start a real car. First you have to start up the vehicle in park by pressing I. This will start the ignition. Then you must put the vehicle in drive by pressing D. Then you can start playing with various functions in the vehicle outlined in the instructions section on the console. For example, the gas pedal is the up arrow. The brake pedal is the down arrow, and so on. 
 
